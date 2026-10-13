@@ -57,6 +57,19 @@ not a race the test lost. And the test was checked to fail when the publication 
 It is raised before the new levels are linked. A reader that sees the new height and a null at the head's top level
 treats null as "past the end" and goes down a level, which is correct, just slower.
 
+**Why link bottom-up, if the node is complete before any link?**
+For monotonic visibility. The completeness of the node makes any order safe for a single reader; bottom-up makes
+it consistent across reads. Once a search can find the node on any level, it is on level 0, so every later search
+and iteration finds it. Linked top-down, a `get` could find a key through an upper level that an iteration started
+after it would miss, while the put was still in progress.
+
+**Why a `VarHandle` and not an `AtomicReferenceArray`?** (`3707eca`)
+`AtomicReferenceArray` is an object wrapping an array: one more object per node (16 bytes) and one more pointer per
+step. A plain array read through `MethodHandles.arrayElementVarHandle` with `getVolatile`/`setVolatile` has the same
+memory semantics. Measured (README, "Results"): 16 bytes less per key and inserts 21% faster, but lookups no faster
+(744,000 vs 722,000 a second, within the noise). I had expected the lookups to improve; they didn't, and the README
+says so.
+
 **Why branching factor 4 and 12 levels?**
 Pugh's analysis gives about `(1/p) log_{1/p} n` comparisons per search: `2 log2 n` for both p = 1/2 and p = 1/4.
 But p = 1/4 needs 1.33 pointers per node instead of 2. Twelve levels serve about 4^12 = 16 million keys at the
@@ -152,6 +165,49 @@ process, and closing any descriptor for the file releases them all. So a second 
 `LOCK`, failed, and closed it would release the first store's lock. The store therefore refuses a second open from a
 JVM-wide set of open directories before touching `LOCK`. `StoreLockTest` uses a child JVM: with the set removed,
 the child opens a directory that is still open here.
+
+## Bugs the review found (day 1)
+
+**Tell me about a bug a review found.** (`StoreLockTest.aSecondRealPathToTheSameDirectoryIsTheSameStore`)
+Two stores could write one log. I had already handled the POSIX trap (closing any descriptor on `LOCK` releases the
+process's lock) with a JVM-wide set of open directories, keyed by real path. But one directory can have two real
+paths: on macOS, `/private/var/...` is also `/System/Volumes/Data/private/var/...` (a firmlink), and `toRealPath`
+keeps them apart; a Linux bind mount or a rename does the same. The second open passed the set, `tryLock` failed
+with `OverlappingFileLockException`, and closing that channel released the first store's lock. A child process then
+opened the store, and in the review's run both wrote sequence number 2 at the same offset: an acknowledged write was
+gone, and recovery said "clean". The fix keys the set by file key (device and inode), and never closes a channel
+whose lock attempt overlapped one this JVM holds; a second class loader, which has a set of its own, still reaches
+that path, and a test uses one to check it.
+
+**Why does the recovery scan have a budget?** (`WalReaderTest.aTornValueBuiltToLookLikeRecordsIsDecidedQuickly`)
+The scan checks cheap fields before checksums, which is linear for zeros or random bytes. But a value can repeat a
+26-byte fake header that passes the cheap checks at every repeat while claiming a long payload, and each repeat then
+costs a checksum over that payload: quadratic. A 4 MiB value torn by a crash took 16.9 s to recover. Any client can
+store such a value. With a budget of checksummed bytes (four times the tail plus 1 MiB), the scan gives up early,
+and recovery fails closed (refuses) because it can't rule out writes after the damage: 0.03 s.
+
+**What does `lastSequence()` mean?** (`StoreFaultTest.lastSequenceNamesOnlyWritesReadsCanSee`)
+The last write reads can see, and so, under `EVERY_WRITE`, the last durable one. It used to advance right after the
+append, while the write was still being forced; anything treating it as "readable up to here" (day 3's follower
+position, say) would have been wrong. A gate in the test channel holds a put mid-flush to show it.
+
+**What does `close` promise?**
+That every acknowledged write is on the device when it returns. The review found the gap: under `NEVER`, close is
+where writes get forced, and a store whose append had failed skipped the force and returned normally. Now it forces
+after a failed append, doesn't after a failed flush (each acknowledged write was forced on its own, and a second
+flush proves nothing), and throws under `NEVER` if an interrupt has left nothing to force with.
+
+**Which tests passed with their mechanism removed?**
+Every force (truncation, directories, close), closing the channel on a refused open, close's write lock, and an
+in-place replacement the concurrency test accepted either way. Each has a test now (`DurabilityTest` counts forces
+per path and file descriptors through `/dev/fd`). One thing still has no test: a plain write where a volatile one
+belongs passes the concurrency test, because its own happens-before counter covers the gap. That needs a
+jcstress-style harness; the property rests on the argument in DESIGN.md.
+
+**What does a durable write cost here?**
+About 3 ms: `EVERY_WRITE`'s median put is 2,990 µs, and a C program doing 128-byte appends with `F_FULLFSYNC`
+measures 2,994 µs, against 26 µs for a plain `fsync`, which doesn't flush the drive's cache. So the store does about
+360 durable writes a second, and 525,000 under `NEVER`. Group commit is the standard way between the two.
 
 ## What's next
 

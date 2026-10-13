@@ -22,6 +22,13 @@ jobs:
           cache: maven
       - name: Test
         run: mvn -B verify
+      - name: Run the packaged command
+        run: |
+          scripts/keystore put target/ci-store city Boston
+          test "$(scripts/keystore get target/ci-store city)" = Boston
+          scripts/keystore delete target/ci-store city
+          if scripts/keystore get target/ci-store city; then exit 1; fi
+          scripts/keystore dump target/ci-store
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v7

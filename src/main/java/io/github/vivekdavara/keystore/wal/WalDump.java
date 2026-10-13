@@ -29,6 +29,7 @@ public final class WalDump {
         out.printf("%s: %d bytes%n", file, log.length);
         Verdict verdict;
         long kept;
+        String refusal = "";
         try {
             Recovery recovery = WalReader.read(log, log.length, 1, RecoveryMode.TOLERATE_TORN_TAIL, r -> {});
             kept = recovery.validBytes();
@@ -36,6 +37,7 @@ public final class WalDump {
         } catch (WalCorruptionException e) {
             kept = e.offset();
             verdict = Verdict.REFUSED;
+            refusal = e.getMessage();
         }
 
         int offset = 0;
@@ -50,7 +52,8 @@ public final class WalDump {
                     "torn tail: recovery drops %d bytes from offset %d (%s), and nothing intact follows%n",
                     log.length - kept, kept, problemAt(log, (int) kept));
             case REFUSED -> {
-                out.printf("damage at offset %d (%s); intact records follow it:%n", kept, problemAt(log, (int) kept));
+                out.printf("refused: %s%n", refusal);
+                out.printf("damage at offset %d (%s); intact records after it:%n", kept, problemAt(log, (int) kept));
                 int dropped = listIntactAfter(log, (int) kept, out);
                 out.printf(
                         "the default mode refuses to open this log; POINT_IN_TIME would keep %d bytes and drop"
@@ -65,7 +68,7 @@ public final class WalDump {
     private static int listIntactAfter(byte[] log, int from, PrintStream out) {
         int count = 0;
         int offset = WalFormat.decode(log, from, log.length) instanceof Ok ? from : WalReader.findIntactRecord(log, from + 1, log.length);
-        while (offset >= 0) {
+        while (offset >= 0) { // NONE or UNDECIDED end the listing
             Decoded decoded = WalFormat.decode(log, offset, log.length);
             if (decoded instanceof Ok ok) {
                 out.printf("%10d  %s%n", offset, describe(ok.record()));

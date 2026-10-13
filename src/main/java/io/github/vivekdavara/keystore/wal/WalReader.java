@@ -12,6 +12,12 @@ import java.util.function.Consumer;
 public final class WalReader {
     private WalReader() {}
 
+    /** {@link #findIntactRecord}: no intact record in the range. */
+    static final int NONE = -1;
+
+    /** {@link #findIntactRecord}: the scan's checksum budget ran out before it could decide. */
+    static final int UNDECIDED = -2;
+
     /**
      * Reads the records in {@code log[0, end)}, passing each good one to {@code apply} in order. A
      * record is good if it decodes and its sequence number is one more than the previous record's
@@ -56,14 +62,20 @@ public final class WalReader {
 
         String damage = "record at offset " + offset + ": " + problem;
         int intact = badRecordIsIntact ? offset : findIntactRecord(log, offset + 1, end);
-        if (intact < 0) {
+        if (intact == NONE) {
             return new Recovery(Recovery.Outcome.TORN_TAIL, records, lastSeq, offset, end - offset, damage);
         }
-        String found = intact == offset
-                ? "the record itself is intact"
-                : "an intact record (#" + ((Ok) WalFormat.decode(log, intact, end)).record().seq()
-                        + ") starts at offset " + intact;
-        String message = damage + "; " + found + ", so the log was written past the damage";
+        String message;
+        if (intact == UNDECIDED) {
+            message = damage + "; the " + (end - offset) + " bytes after it look like log records in many places,"
+                    + " and the scan for an intact one ran out of its budget before it could rule one out";
+        } else {
+            String found = intact == offset
+                    ? "the record itself is intact"
+                    : "an intact record (#" + ((Ok) WalFormat.decode(log, intact, end)).record().seq()
+                            + ") starts at offset " + intact;
+            message = damage + "; " + found + ", so the log was written past the damage";
+        }
         if (mode == RecoveryMode.POINT_IN_TIME) {
             return new Recovery(Recovery.Outcome.DAMAGE_DROPPED, records, lastSeq, offset, end - offset, message);
         }
@@ -72,13 +84,28 @@ public final class WalReader {
                 offset);
     }
 
-    /** The first offset in {@code [from, end)} where an intact record starts, or -1. */
+    /**
+     * The first offset in {@code [from, end)} where an intact record starts, {@link #NONE}, or
+     * {@link #UNDECIDED}. Offsets whose cheap fields fail cost a few comparisons; each one that
+     * passes costs a checksum over its claimed payload, and those bytes are charged to a budget of
+     * four times the range plus 1 MiB. Zeros, random bytes and real records use almost none of it;
+     * a value built to look like records at every offset would make the scan quadratic without it.
+     */
     static int findIntactRecord(byte[] log, int from, int end) {
+        long budget = 4L * Math.max(0, end - from) + (1 << 20);
         for (int offset = from; offset < end; offset++) {
-            if (WalFormat.intactAt(log, offset, end)) {
+            int length = WalFormat.plausibleLength(log, offset, end);
+            if (length < 0) {
+                continue;
+            }
+            budget -= length;
+            if (budget < 0) {
+                return UNDECIDED;
+            }
+            if (WalFormat.checksumMatches(log, offset, length)) {
                 return offset;
             }
         }
-        return -1;
+        return NONE;
     }
 }

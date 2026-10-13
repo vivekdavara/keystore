@@ -12,7 +12,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.SplittableRandom;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 class WalReaderTest {
     /** Records of different shapes and sizes, seq 1..6. */
@@ -205,12 +207,46 @@ class WalReaderTest {
         assertEquals(log.ends[6], recovery.validBytes());
     }
 
+    /**
+     * Found by review: a value that repeats a 26-byte fake header (a put of length L, key length 1,
+     * value length L - 18, a bad checksum) passes the cheap checks at every repeat, and each repeat
+     * cost a checksum over L bytes, so the scan was quadratic: a 4 MiB torn value took 16 s, 16 MiB
+     * over 4 minutes. The scan now has a budget of checksummed bytes, and when it runs out recovery
+     * can't rule out writes after the damage, so the default refuses (fail closed).
+     */
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void aTornValueBuiltToLookLikeRecordsIsDecidedQuickly() throws Exception {
+        int size = 4 << 20;
+        ByteBuffer period = ByteBuffer.allocate(26)
+                .putInt(size / 2).putInt(0).putLong(1).put((byte) 1).putInt(1).put((byte) 'x').putInt(size / 2 - 18);
+        byte[] value = new byte[size];
+        for (int i = 0; i < size; i++) {
+            value[i] = period.get(i % 26);
+        }
+        Log log = Log.of(List.of(RECORDS.get(0), WalRecord.put(2, utf8("big"), value)));
+        int end = log.bytes.length - 1; // a crash one byte short of finishing #2
+
+        long start = System.nanoTime();
+        WalCorruptionException refused = assertThrows(
+                WalCorruptionException.class,
+                () -> WalReader.read(log.bytes, end, 1, RecoveryMode.TOLERATE_TORN_TAIL, r -> {}));
+        long millis = (System.nanoTime() - start) / 1_000_000;
+        assertEquals(log.ends[1], refused.offset());
+        assertTrue(refused.getMessage().contains("ran out of its budget"), refused.getMessage());
+
+        Recovery recovery = WalReader.read(log.bytes, end, 1, RecoveryMode.POINT_IN_TIME, r -> {});
+        assertEquals(Outcome.DAMAGE_DROPPED, recovery.outcome());
+        assertEquals(1, recovery.records());
+        assertTrue(millis < 10_000, millis + " ms");
+    }
+
     @Test
     void theScanFindsTheFirstIntactRecordOnly() {
         Log log = Log.of(RECORDS);
         assertEquals(log.ends[1], WalReader.findIntactRecord(log.bytes, 1, log.bytes.length));
-        assertEquals(-1, WalReader.findIntactRecord(log.bytes, log.ends[5] + 1, log.bytes.length));
-        assertEquals(-1, WalReader.findIntactRecord(new byte[1 << 20], 0, 1 << 20));
+        assertEquals(WalReader.NONE, WalReader.findIntactRecord(log.bytes, log.ends[5] + 1, log.bytes.length));
+        assertEquals(WalReader.NONE, WalReader.findIntactRecord(new byte[1 << 20], 0, 1 << 20));
     }
 
     private static byte[] flip(byte[] bytes, int bit) {

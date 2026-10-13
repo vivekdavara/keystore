@@ -153,15 +153,28 @@ public final class WalFormat {
      * calls this at every offset after damage).
      */
     static boolean intactAt(byte[] log, int offset, int end) {
+        int length = plausibleLength(log, offset, end);
+        return length >= 0 && checksumMatches(log, offset, length);
+    }
+
+    /**
+     * The payload length of the record at {@code offset} if its cheap fields all pass (a length in
+     * bounds that fits, and a structure that fills the payload exactly), else -1. Copies nothing.
+     */
+    static int plausibleLength(byte[] log, int offset, int end) {
         if (end - offset < HEADER_BYTES + MIN_PAYLOAD) {
-            return false;
+            return -1;
         }
         int length = intAt(log, offset);
         if (length < MIN_PAYLOAD || length > MAX_PAYLOAD || length > end - offset - HEADER_BYTES) {
-            return false;
+            return -1;
         }
-        return structureProblem(log, offset, length) == null
-                && intAt(log, offset + 4) == checksum(log, offset, length);
+        return structureProblem(log, offset, length) == null ? length : -1;
+    }
+
+    /** Whether the stored checksum of the record at {@code offset}, of this payload length, matches. */
+    static boolean checksumMatches(byte[] log, int offset, int length) {
+        return intAt(log, offset + 4) == checksum(log, offset, length);
     }
 
     /** What is wrong with a payload's fields, or null if nothing is; the length is known to fit. */

@@ -7,15 +7,18 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.WritableByteChannel;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A file channel that fails on demand: writes after a byte budget runs out (writing the part that
- * fits first, as a real short write would), and forces. Everything else goes to the real channel.
+ * fits first, as a real short write would), and forces. It also counts forces. Everything else goes
+ * to the real channel.
  */
 final class FaultyChannel extends FileChannel {
     private final FileChannel inner;
     private volatile long writeBudget = Long.MAX_VALUE;
     private volatile boolean failForce;
+    private final AtomicInteger forces = new AtomicInteger();
 
     FaultyChannel(FileChannel inner) {
         this.inner = inner;
@@ -28,6 +31,11 @@ final class FaultyChannel extends FileChannel {
 
     void failForces() {
         failForce = true;
+    }
+
+    /** Forces that reached the real channel. */
+    int forces() {
+        return forces.get();
     }
 
     @Override
@@ -52,6 +60,7 @@ final class FaultyChannel extends FileChannel {
             throw new IOException("injected: force failed");
         }
         inner.force(metaData);
+        forces.incrementAndGet();
     }
 
     @Override

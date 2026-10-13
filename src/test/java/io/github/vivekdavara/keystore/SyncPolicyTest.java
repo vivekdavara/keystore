@@ -17,7 +17,10 @@ class SyncPolicyTest {
     private final AtomicReference<FaultyChannel> channel = new AtomicReference<>();
 
     private Store open(SyncPolicy sync) throws IOException {
-        return Store.open(dir, Options.defaults().withSync(sync), inner -> {
+        return Store.open(dir, Options.defaults().withSync(sync), (path, inner) -> {
+            if (!path.endsWith(Store.LOG_FILE)) {
+                return inner;
+            }
             FaultyChannel counting = new FaultyChannel(inner);
             channel.set(counting);
             return counting;

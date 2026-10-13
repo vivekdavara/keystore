@@ -2,6 +2,7 @@ package io.github.vivekdavara.keystore;
 
 import io.github.vivekdavara.keystore.memtable.Entry;
 import io.github.vivekdavara.keystore.memtable.MemTable;
+import io.github.vivekdavara.keystore.wal.LogFullException;
 import io.github.vivekdavara.keystore.wal.Recovery;
 import io.github.vivekdavara.keystore.wal.WalFormat;
 import io.github.vivekdavara.keystore.wal.WalRecord;
@@ -15,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -22,7 +24,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.UnaryOperator;
+import java.util.function.BiFunction;
 
 /**
  * A key-value store in one directory: a write-ahead log and a memtable (day 1).
@@ -63,6 +65,7 @@ public final class Store implements Closeable {
     private final ReentrantLock writeLock = new ReentrantLock();
     private volatile long lastSeq; // written only under writeLock
     private Throwable failure; // guarded by writeLock
+    private boolean failedFlush; // guarded by writeLock: the failure came from forcing the log
     private volatile boolean closed;
 
     private Store(
@@ -93,13 +96,16 @@ public final class Store implements Closeable {
      *     way {@code options.recovery()} refuses
      */
     public static Store open(Path dir, Options options) throws IOException {
-        return open(dir, options, UnaryOperator.identity());
+        return open(dir, options, (path, channel) -> channel);
     }
 
-    /** {@link #open(Path, Options)}, with the log's channel wrapped: for fault injection in tests. */
-    static Store open(Path dir, Options options, UnaryOperator<FileChannel> wrapLog) throws IOException {
+    /**
+     * {@link #open(Path, Options)}, with every channel on the log and on directories wrapped: for
+     * fault injection and counting in tests.
+     */
+    static Store open(Path dir, Options options, BiFunction<Path, FileChannel, FileChannel> wrap) throws IOException {
         Objects.requireNonNull(options, "options");
-        createDirectory(dir);
+        createDirectory(dir, wrap);
         Path real = dir.toRealPath();
         Object identity = identity(real);
         if (!OPEN_IN_THIS_JVM.add(identity)) {
@@ -123,8 +129,8 @@ public final class Store implements Closeable {
                 throw new StoreLockedException(dir + " is open in another process");
             }
             MemTable memtable = new MemTable();
-            WriteAheadLog.Opened opened =
-                    WriteAheadLog.open(real.resolve(LOG_FILE), options.recovery(), r -> apply(memtable, r), wrapLog);
+            WriteAheadLog.Opened opened = WriteAheadLog.open(
+                    real.resolve(LOG_FILE), options.recovery(), r -> apply(memtable, r), options.maxLogBytes(), wrap);
             return new Store(real, identity, options, lockChannel, lock, opened.log(), memtable, opened.recovery());
         } catch (IOException | RuntimeException | Error e) {
             if (lockChannel != null) {
@@ -149,23 +155,32 @@ public final class Store implements Closeable {
         return key != null ? key : real;
     }
 
-    /** Creates the directory if needed, and then forces its parent so the new entry survives a crash. */
-    private static void createDirectory(Path dir) throws IOException {
-        if (Files.isDirectory(dir)) {
+    /**
+     * Creates the directory and any missing ancestors, then forces the parent of each one created,
+     * top down, so every new entry survives a crash (forcing only the last parent would leave the
+     * entries above it unforced).
+     */
+    private static void createDirectory(Path dir, BiFunction<Path, FileChannel, FileChannel> wrap) throws IOException {
+        List<Path> missing = new ArrayList<>(); // deepest first
+        for (Path p = dir.toAbsolutePath(); p != null && !Files.isDirectory(p); p = p.getParent()) {
+            missing.add(p);
+        }
+        if (missing.isEmpty()) {
             return;
         }
         Files.createDirectories(dir);
-        Path parent = dir.toAbsolutePath().getParent();
-        if (parent != null) {
-            try (FileChannel channel = FileChannel.open(parent, StandardOpenOption.READ)) {
-                channel.force(true);
+        for (int i = missing.size() - 1; i >= 0; i--) {
+            Path parent = missing.get(i).getParent();
+            if (parent != null) {
+                WriteAheadLog.forceDirectory(parent, wrap);
             }
         }
     }
 
     /**
      * Sets {@code key} to {@code value}. When this returns the write is in the log (and, under
-     * {@link SyncPolicy#EVERY_WRITE}, on the device) and visible to readers. If it throws an
+     * {@link SyncPolicy#EVERY_WRITE}, on the device) and visible to readers. If it throws
+     * {@link LogFullException}, nothing was written and the store goes on. If it throws another
      * {@link IOException}, the write may or may not have reached the log, and the store accepts no
      * more writes ({@link StoreFailedException}) until it is reopened.
      *
@@ -198,20 +213,26 @@ public final class Store implements Closeable {
             }
             long seq = lastSeq + 1;
             WalRecord record = value == null ? WalRecord.delete(seq, key) : WalRecord.put(seq, key, value);
+            log.ensureRoomFor(record); // LogFullException: nothing written, the store goes on
+            boolean flushing = false;
             try {
                 log.append(record);
-                lastSeq = seq; // in the log now, so the next write must not reuse the number
                 if (options.sync() == SyncPolicy.EVERY_WRITE) {
+                    flushing = true;
                     log.sync();
+                    flushing = false;
                 }
                 apply(memtable, record);
             } catch (IOException | RuntimeException | Error e) {
                 // The log may now end in part of a record, or a flush may have dropped pages it was
                 // meant to write: appending more could bury that, and retrying a failed flush can
-                // falsely succeed. Stop writing; reopening recovers.
+                // falsely succeed. Stop writing; reopening recovers. (No later write can reuse this
+                // sequence number, since there are no later writes.)
                 failure = e;
+                failedFlush = flushing;
                 throw e;
             }
+            lastSeq = seq; // only now: lastSequence() never names a write that reads can't see
         } finally {
             writeLock.unlock();
         }
@@ -233,7 +254,11 @@ public final class Store implements Closeable {
         return recovery;
     }
 
-    /** The sequence number of the last write, or 0 if there has been none. */
+    /**
+     * The sequence number of the last write visible to reads (and, under
+     * {@link SyncPolicy#EVERY_WRITE}, on the device), or 0 if there has been none. Still answers
+     * after {@link #close}.
+     */
     public long lastSequence() {
         return lastSeq;
     }
@@ -259,9 +284,18 @@ public final class Store implements Closeable {
     }
 
     /**
-     * Forces the log, closes it and releases the directory. Waits for a write in progress. Calls
-     * after this fail with {@link IllegalStateException}; closing again does nothing. A store whose
-     * writes failed closes its log without forcing it.
+     * Forces the log, closes it and releases the directory, so that when it returns every
+     * acknowledged write is on the device, whatever the sync policy. Waits for a write in progress.
+     * Afterwards {@link #put}, {@link #delete} and {@link #get} fail with
+     * {@link IllegalStateException} (the accessors still answer); closing again does nothing.
+     *
+     * <p>A store whose writes failed: after a failed flush (under {@link SyncPolicy#EVERY_WRITE})
+     * every write acknowledged before it was forced on its own, and forcing again proves nothing,
+     * so the log is closed as it is. After a failed append the log is still forced, since under
+     * {@link SyncPolicy#NEVER} the writes before it need it (the partial record goes with them, and
+     * recovery drops it). If the log can't be forced at all (an interrupt closed it), under
+     * {@code NEVER} this throws {@link StoreFailedException}, since acknowledged writes may not be on
+     * the device; the directory is released either way.
      */
     @Override
     public void close() throws IOException {
@@ -272,11 +306,7 @@ public final class Store implements Closeable {
             }
             closed = true;
             try {
-                if (failure == null) {
-                    log.close();
-                } else {
-                    log.abandon();
-                }
+                closeLog();
             } finally {
                 try {
                     lock.release();
@@ -290,6 +320,19 @@ public final class Store implements Closeable {
             }
         } finally {
             writeLock.unlock();
+        }
+    }
+
+    private void closeLog() throws IOException {
+        if (failure == null || (!failedFlush && log.isOpen())) {
+            log.close(); // forces, then closes
+            return;
+        }
+        log.abandon();
+        if (!failedFlush && options.sync() == SyncPolicy.NEVER) {
+            throw new StoreFailedException(
+                    "the log could not be forced at close, so writes acknowledged under SyncPolicy.NEVER may"
+                            + " not be on the device", failure);
         }
     }
 

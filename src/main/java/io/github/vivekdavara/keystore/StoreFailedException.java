@@ -11,6 +11,10 @@ public final class StoreFailedException extends IOException {
     private static final long serialVersionUID = 1L;
 
     public StoreFailedException(Throwable cause) {
-        super("an earlier write failed, so this store accepts no more writes; reopen it to recover: " + cause, cause);
+        this("an earlier write failed, so this store accepts no more writes; reopen it to recover", cause);
+    }
+
+    public StoreFailedException(String message, Throwable cause) {
+        super(message + ": " + cause, cause);
     }
 }

@@ -131,6 +131,10 @@ runs, each run after a warm-up run in the same JVM. These are plain wall-clock t
 | Skip list, 1,000,000 inserts then lookups, one thread | 877,000 inserts/s, 781,000 lookups/s | `Bench skiplist 1000000` |
 | `ConcurrentSkipListMap`, the same | 892,000 inserts/s, 870,000 lookups/s | same |
 
+Rechecked at `d63a17a`, after the review's fixes, with the same commands: `NEVER` 504,305 to 525,399 writes/s
+(3 runs), `EVERY_WRITE` 355 to 360 writes/s with a median put of 2,990 µs (3 runs), recovery of the 1,000,000 puts
+278 ms (1 run). All within the spread above.
+
 What the numbers say:
 
 - **A durable write costs one drive-cache flush.** `EVERY_WRITE`'s median put (2,990 µs) is the C program's

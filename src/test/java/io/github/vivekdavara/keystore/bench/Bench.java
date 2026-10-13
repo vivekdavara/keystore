@@ -1,9 +1,11 @@
 package io.github.vivekdavara.keystore.bench;
 
+import io.github.vivekdavara.keystore.Bytes;
 import io.github.vivekdavara.keystore.Options;
 import io.github.vivekdavara.keystore.Store;
 import io.github.vivekdavara.keystore.SyncPolicy;
 import io.github.vivekdavara.keystore.memtable.MemTable;
+import io.github.vivekdavara.keystore.memtable.SkipList;
 import io.github.vivekdavara.keystore.wal.RecoveryMode;
 import io.github.vivekdavara.keystore.wal.WalFormat;
 import io.github.vivekdavara.keystore.wal.WalReader;
@@ -16,6 +18,9 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.SplittableRandom;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
 import java.util.stream.Stream;
 
 /**
@@ -28,6 +33,7 @@ import java.util.stream.Stream;
  * recover COUNT VALUE_BYTES       time to open a store whose log holds COUNT puts
  * scan TAIL_BYTES zeros|random    time to read a log of one record and a damaged tail
  * memory COUNT VALUE_BYTES        heap bytes per key in a memtable, against approximateBytes
+ * skiplist COUNT                  inserts and lookups: this skip list against ConcurrentSkipListMap
  * </pre>
  */
 public final class Bench {
@@ -39,6 +45,7 @@ public final class Bench {
             case "recover" -> recover(Integer.parseInt(args[1]), Integer.parseInt(args[2]));
             case "scan" -> scan(Integer.parseInt(args[1]), args[2]);
             case "memory" -> memory(Integer.parseInt(args[1]), Integer.parseInt(args[2]));
+            case "skiplist" -> skiplist(Integer.parseInt(args[1]));
             default -> throw new IllegalArgumentException("unknown benchmark " + args[0]);
         }
     }
@@ -150,6 +157,67 @@ public final class Bench {
         if (table.size() != count) {
             throw new AssertionError(table.size());
         }
+    }
+
+    /**
+     * Single-threaded inserts of COUNT keys in random order, then COUNT lookups of present keys in
+     * another random order, into this skip list and into the JDK's ConcurrentSkipListMap with the
+     * same comparator. Each structure is timed in its own pass, alternating, after a warm-up pass.
+     */
+    private static void skiplist(int count) {
+        byte[][] keys = new byte[count][];
+        for (int i = 0; i < count; i++) {
+            keys[i] = key(i);
+        }
+        int[] insertOrder = shuffled(count, 5);
+        int[] lookupOrder = shuffled(count, 6);
+        for (int run = 0; run < 2; run++) {
+            for (String which : new String[] {"SkipList", "ConcurrentSkipListMap"}) {
+                BiConsumer<byte[], Integer> put;
+                Function<byte[], Integer> get;
+                if (which.equals("SkipList")) {
+                    SkipList<byte[], Integer> list = new SkipList<>(Bytes.ORDER);
+                    put = list::put;
+                    get = list::get;
+                } else {
+                    ConcurrentSkipListMap<byte[], Integer> map = new ConcurrentSkipListMap<>(Bytes.ORDER);
+                    put = map::put;
+                    get = map::get;
+                }
+                long t0 = System.nanoTime();
+                for (int i : insertOrder) {
+                    put.accept(keys[i], i);
+                }
+                long t1 = System.nanoTime();
+                long found = 0;
+                for (int i : lookupOrder) {
+                    found += get.apply(keys[i]) == i ? 1 : 0;
+                }
+                long t2 = System.nanoTime();
+                if (found != count) {
+                    throw new AssertionError(which + " found " + found);
+                }
+                if (run == 1) {
+                    System.out.printf("skiplist %s count=%d: %.0f inserts/s, %.0f lookups/s%n",
+                            which, count, count / seconds(t0, t1), count / seconds(t1, t2));
+                }
+            }
+        }
+    }
+
+    private static int[] shuffled(int n, long seed) {
+        int[] order = new int[n];
+        for (int i = 0; i < n; i++) {
+            order[i] = i;
+        }
+        SplittableRandom random = new SplittableRandom(seed);
+        for (int i = n - 1; i > 0; i--) {
+            int j = random.nextInt(i + 1);
+            int t = order[i];
+            order[i] = order[j];
+            order[j] = t;
+        }
+        return order;
     }
 
     /** A byte array's heap size on a 64-bit JVM: a 16-byte header, then the data, rounded up to 8. */

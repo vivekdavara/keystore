@@ -20,3 +20,4 @@ for _ in $(seq "$runs"); do bench recover 1000000 100; done
 for _ in $(seq "$runs"); do bench scan 67108864 zeros; done
 for _ in $(seq "$runs"); do bench scan 67108864 random; done
 for _ in $(seq "$runs"); do bench memory 1000000 100; done
+for _ in $(seq "$runs"); do bench skiplist 1000000; done

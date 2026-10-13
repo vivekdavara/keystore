@@ -107,6 +107,7 @@ try (Store store = Store.open(Path.of("target/demo"))) {
 | A write that fails partway, a failed flush, and an interrupted writer each stop writes until a reopen; close forces what it must; a write past the log's limit is refused | `StoreFaultTest` |
 | `EVERY_WRITE` forces every write before it returns, `NEVER` only at close | `SyncPolicyTest` |
 | Every new directory's parent, the log's directory on every open, and a truncation are forced; a refused open leaks no file descriptor | `DurabilityTest` |
+| 200 crash-and-recover cycles (a write dying at a random byte, zero or garbage tails) leave exactly the acknowledged writes, 3 seeds | `CrashCycleTest` |
 | The `keystore` command, including a read-only dump of a damaged log | `MainTest` |
 
 Most of the mechanisms these tests cover were also checked the other way round: removed in a copy of the file, a

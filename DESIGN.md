@@ -336,6 +336,11 @@ the damage, which `POINT_IN_TIME` would drop, so the operator can decide with th
   sequence records.
 - **The store.** Put, get and delete through reopen, both sync policies, the lock (with a child JVM), and failures:
   a log channel that fails a write partway or fails a flush on demand (`FaultyChannel`), and an interrupted writer.
+- **Crash cycles.** `CrashCycleTest` runs 200 cycles per seed of: reopen, check every key against a model of the
+  acknowledged writes, random writes, then what a killed process leaves (a write dying at a random byte of its
+  record, sometimes a zero-filled or random tail after it). After every recovery the store holds exactly the
+  acknowledged writes, and `lastSequence()` counts them. If recovery appended after the torn bytes instead of
+  truncating them, it fails on all 3 seeds. (Real process kills are day 4's.)
 - **Do the tests fail when they should?** Each mechanism below was removed (in a copy of the file, restored after)
   to check that a test fails without it:
   - the skip list: linking a node before filling it in (all 3 runs of the concurrency test fail within 0.2 s, on

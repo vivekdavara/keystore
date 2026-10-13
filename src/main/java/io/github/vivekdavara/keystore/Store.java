@@ -23,6 +23,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
 
@@ -63,7 +64,12 @@ public final class Store implements Closeable {
     private final Recovery recovery;
 
     private final ReentrantLock writeLock = new ReentrantLock();
-    private volatile long lastSeq; // written only under writeLock
+    /**
+     * Written only under writeLock. An AtomicLong in a final field, not a volatile long, so that a
+     * Store handed to another thread without synchronisation still shows the recovered value: the
+     * final-field guarantee covers what the field refers to, but not a volatile set in a constructor.
+     */
+    private final AtomicLong lastSeq;
     private Throwable failure; // guarded by writeLock
     private boolean failedFlush; // guarded by writeLock: the failure came from forcing the log
     private volatile boolean closed;
@@ -79,7 +85,7 @@ public final class Store implements Closeable {
         this.log = log;
         this.memtable = memtable;
         this.recovery = recovery;
-        this.lastSeq = recovery.lastSeq();
+        this.lastSeq = new AtomicLong(recovery.lastSeq());
     }
 
     /** Opens the store in {@code dir} with {@link Options#defaults()}, creating it if needed. */
@@ -211,7 +217,7 @@ public final class Store implements Closeable {
             if (failure != null) {
                 throw new StoreFailedException(failure);
             }
-            long seq = lastSeq + 1;
+            long seq = lastSeq.get() + 1;
             WalRecord record = value == null ? WalRecord.delete(seq, key) : WalRecord.put(seq, key, value);
             log.ensureRoomFor(record); // LogFullException: nothing written, the store goes on
             boolean flushing = false;
@@ -232,7 +238,7 @@ public final class Store implements Closeable {
                 failedFlush = flushing;
                 throw e;
             }
-            lastSeq = seq; // only now: lastSequence() never names a write that reads can't see
+            lastSeq.set(seq); // only now: lastSequence() never names a write that reads can't see
         } finally {
             writeLock.unlock();
         }
@@ -260,7 +266,7 @@ public final class Store implements Closeable {
      * after {@link #close}.
      */
     public long lastSequence() {
-        return lastSeq;
+        return lastSeq.get();
     }
 
     /** The store's directory (its real path). */

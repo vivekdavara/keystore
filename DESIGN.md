@@ -175,7 +175,10 @@ The log is a file opened for writing at its end. A record is encoded into one bu
 `FileChannel.write` until every byte is out (one write call for any record that fits the OS's buffers). Under
 `EVERY_WRITE` the store then calls `force(false)`: `fdatasync` on Linux, which also persists the file's length when
 it grew; on macOS the JDK issues `fcntl(F_FULLFSYNC)`, which flushes the drive's own cache, where a plain `fsync`
-does not.
+does not. That last claim is checked, not assumed: in this machine's JDK (Homebrew OpenJDK 21.0.12),
+`otool -tV $JAVA_HOME/lib/libnio.dylib` shows `Java_sun_nio_ch_FileDispatcherImpl_force0` calling `fcntl` with
+`0x33` (51, `F_FULLFSYNC`), and falling back to `fsync` only when that fails on a filesystem that isn't local. It
+is why a forced write costs milliseconds here (README, "Results").
 
 When the store creates the log, it also forces the directory, so the file's directory entry survives a crash.
 
@@ -245,10 +248,28 @@ is intact but in the wrong place (old bytes left beyond a truncation, say); the 
 - **The outcome of a failed write is unknown.** The caller got an exception, but the record may have reached the
   device; if it did, recovery replays it. This is the same as any timeout in a distributed system, and it's why
   replication (day 3) identifies writes by sequence number.
-- **One process at a time.** `Store.open` takes `LOCK` with `tryLock`; a second open fails at once, in another
-  process or in the same JVM.
+- **One process at a time.** `Store.open` takes `LOCK` with `FileChannel.tryLock`; a second open fails at once
+  with `StoreLockedException`, in another process or in the same JVM. The same-JVM case needs care. These are POSIX
+  record locks: they belong to the process, not to a channel, and closing *any* descriptor for the file releases
+  all of them. A second open that opened `LOCK`, failed to lock it (Java reports `OverlappingFileLockException`)
+  and closed its channel would silently release the first store's lock, and another process could then open the
+  directory while the first store is still writing. So the store keeps a JVM-wide set of open directories (by real
+  path, so a symlink or a `..` path is the same directory) and refuses a second open before touching `LOCK`. Lucene's
+  `NativeFSLockFactory` keeps the same kind of set for the same reason. A test runs a child JVM to show the lock
+  holds after a refused second open; without the set, the child opens the directory.
+- **An interrupted writer stops the store's writes.** `FileChannel` is an interruptible channel: if a thread is
+  interrupted while in (or entering) a channel operation, the JDK closes the channel and throws
+  `ClosedByInterruptException`. The log's channel is shared, so one interrupted writer fails the store as above,
+  and every later write gets `StoreFailedException` until a reopen; reads go on. Callers must not interrupt
+  threads that write. The fix is to do the log's I/O on a thread of its own, which group commit (day 4) needs anyway.
 - **Close** forces the log (whatever the sync policy), closes it and releases the lock. Calls after `close` fail
-  with `IllegalStateException`. `close` waits for a write in progress, since it takes the write lock.
+  with `IllegalStateException`. `close` waits for a write in progress, since it takes the write lock. A store whose
+  writes failed closes its log without forcing it: a flush after a failed one proves nothing, and after an
+  interrupt the channel is already closed.
+
+**Inspecting a log.** `keystore dump DIR` (README, "Run it") reads the log without changing it, lists every record
+with its offset, and says what recovery would do. For a log the default refuses, it lists the intact records after
+the damage, which `POINT_IN_TIME` would drop, so the operator can decide with the facts in front of them.
 
 ## Testing (day 1)
 
@@ -264,8 +285,12 @@ is intact but in the wrong place (old bytes left beyond a truncation, say); the 
   records that ended before the cut; flip each bit of the log (or of chosen records) and check the outcome is right
   for where the flip landed; zero-filled and garbage tails; a damaged length that would allocate gigabytes; out-of-
   sequence records.
-- **The store.** Put, get and delete through reopen, both sync policies, the lock, and a failed write stopping
-  further writes (with a log whose file channel fails on demand).
+- **The store.** Put, get and delete through reopen, both sync policies, the lock (with a child JVM), and failures:
+  a log channel that fails a write partway or fails a flush on demand (`FaultyChannel`), and an interrupted writer.
+- **Do the tests fail when they should?** Each mechanism below was removed (in a copy of the file) to check that a
+  test fails without it: linking a skip list node before filling it in (all 3 runs of the concurrency test fail
+  within 0.2 s), the JVM-wide set of open directories (the child JVM opens a directory that is still open), marking
+  the store failed after an error (5 of 5 fault tests fail), and closing a failed log without forcing it (3 of 5).
 
 ## Plan for days 2–5
 

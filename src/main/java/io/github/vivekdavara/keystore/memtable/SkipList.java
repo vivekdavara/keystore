@@ -9,7 +9,8 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.SplittableRandom;
-import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.random.RandomGenerator;
 
 /**
@@ -20,8 +21,9 @@ import java.util.random.RandomGenerator;
  * writer. Nodes are never removed.
  *
  * <p>Why the readers are safe: the writer fills in a new node completely (key, value, its own next
- * pointers) and only then links it in, bottom level first, each link a volatile write. A reader
- * follows links with volatile reads, so whatever node it reaches, it sees that node fully built.
+ * pointers) and only then links it in, bottom level first, each link a volatile write (through a
+ * {@link VarHandle} on the node's array of next pointers). A reader follows links with volatile
+ * reads, so whatever node it reaches, it sees that node fully built.
  * It may see a node on level 0 before the node is linked on the levels above; it then finds the
  * node by going down, which is only slower. DESIGN.md has the full argument.
  */
@@ -31,6 +33,9 @@ public final class SkipList<K, V> implements Iterable<Map.Entry<K, V>> {
 
     /** Each node is on each further level with probability 1/BRANCHING. */
     private static final int BRANCHING = 4;
+
+    /** Volatile access to the elements of a node's next array (plain arrays have no volatile elements). */
+    private static final VarHandle NEXT = MethodHandles.arrayElementVarHandle(Node[].class);
 
     private final Comparator<? super K> order;
     private final RandomGenerator random; // used by the writer only
@@ -88,12 +93,12 @@ public final class SkipList<K, V> implements Iterable<Map.Entry<K, V>> {
         Node<K, V> node = new Node<>(key, value, nodeHeight);
         // 1. Fill in the node. Nobody else can see it yet, so plain writes are enough.
         for (int level = 0; level < nodeHeight; level++) {
-            node.next.setPlain(level, prev[level].next(level));
+            node.next[level] = prev[level].next(level);
         }
         // 2. Link it in, bottom up. Each volatile write publishes the node, and everything written
         //    to it above, to any reader that follows that link.
         for (int level = 0; level < nodeHeight; level++) {
-            prev[level].next.set(level, node);
+            prev[level].link(level, node);
         }
         size = size + 1; // only the writer writes size
         return null;
@@ -165,8 +170,8 @@ public final class SkipList<K, V> implements Iterable<Map.Entry<K, V>> {
                 if (!keys.isEmpty() && order.compare(keys.get(keys.size() - 1), node.key) >= 0) {
                     throw new AssertionError("level " + level + " is not strictly sorted");
                 }
-                if (node.next.length() <= level) {
-                    throw new AssertionError("a node of height " + node.next.length() + " on level " + level);
+                if (node.next.length <= level) {
+                    throw new AssertionError("a node of height " + node.next.length + " on level " + level);
                 }
                 keys.add(node.key);
             }
@@ -196,16 +201,26 @@ public final class SkipList<K, V> implements Iterable<Map.Entry<K, V>> {
     private static final class Node<K, V> {
         final K key;
         volatile V value;
-        final AtomicReferenceArray<Node<K, V>> next;
+        /** Next pointers, one per level. Read and linked through {@link #NEXT}; plain writes only
+         *  before the node is published. */
+        final Node<K, V>[] next;
 
+        @SuppressWarnings("unchecked")
         Node(K key, V value, int height) {
             this.key = key;
             this.value = value;
-            this.next = new AtomicReferenceArray<>(height);
+            this.next = (Node<K, V>[]) new Node<?, ?>[height];
         }
 
+        /** A volatile read of the next pointer on {@code level}. */
+        @SuppressWarnings("unchecked")
         Node<K, V> next(int level) {
-            return next.get(level);
+            return (Node<K, V>) NEXT.getVolatile(next, level);
+        }
+
+        /** A volatile write of the next pointer on {@code level}: publishes {@code node} there. */
+        void link(int level, Node<K, V> node) {
+            NEXT.setVolatile(next, level, node);
         }
     }
 

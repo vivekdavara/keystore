@@ -14,10 +14,13 @@ import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.UnaryOperator;
 
@@ -33,14 +36,23 @@ public final class Store implements Closeable {
     static final String LOG_FILE = "wal.log";
 
     /**
-     * Directories open in this JVM. POSIX file locks belong to the process, and closing any channel
-     * on the file releases them, so a second open in this JVM must be refused before it opens the
-     * lock file at all: closing its channel would drop the first store's lock. Lucene's native lock
-     * factory keeps the same kind of set.
+     * Directories open in this JVM, by {@link #identity}. POSIX file locks belong to the process,
+     * and closing any channel on the file releases them, so a second open in this JVM must be
+     * refused before it opens the lock file at all: closing its channel would drop the first
+     * store's lock. Lucene's native lock factory keeps the same kind of set.
      */
-    private static final Set<Path> OPEN_IN_THIS_JVM = ConcurrentHashMap.newKeySet();
+    private static final Set<Object> OPEN_IN_THIS_JVM = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Lock-file channels that must never be closed: each found the lock already held by this JVM
+     * through another channel, which means the set above missed a second path to an open
+     * directory. Closing one would release the other store's lock, so they stay open, and
+     * referenced so that no cleaner closes them, for the life of the JVM.
+     */
+    private static final List<FileChannel> KEPT_OPEN = new CopyOnWriteArrayList<>();
 
     private final Path dir;
+    private final Object identity;
     private final Options options;
     private final FileChannel lockChannel;
     private final FileLock lock;
@@ -54,9 +66,10 @@ public final class Store implements Closeable {
     private volatile boolean closed;
 
     private Store(
-            Path dir, Options options, FileChannel lockChannel, FileLock lock, WriteAheadLog log,
+            Path dir, Object identity, Options options, FileChannel lockChannel, FileLock lock, WriteAheadLog log,
             MemTable memtable, Recovery recovery) {
         this.dir = dir;
+        this.identity = identity;
         this.options = options;
         this.lockChannel = lockChannel;
         this.lock = lock;
@@ -88,7 +101,8 @@ public final class Store implements Closeable {
         Objects.requireNonNull(options, "options");
         createDirectory(dir);
         Path real = dir.toRealPath();
-        if (!OPEN_IN_THIS_JVM.add(real)) {
+        Object identity = identity(real);
+        if (!OPEN_IN_THIS_JVM.add(identity)) {
             throw new StoreLockedException(dir + " is already open in this process");
         }
         FileChannel lockChannel = null;
@@ -99,7 +113,11 @@ public final class Store implements Closeable {
             try {
                 lock = lockChannel.tryLock();
             } catch (OverlappingFileLockException e) {
-                lock = null; // can't happen while the set above works; refuse all the same
+                // This JVM holds the lock through another channel: the set missed another path to an
+                // open directory. Closing this channel would release that lock, so it stays open.
+                KEPT_OPEN.add(lockChannel);
+                lockChannel = null;
+                throw new StoreLockedException(dir + " is already open in this process, by another path");
             }
             if (lock == null) {
                 throw new StoreLockedException(dir + " is open in another process");
@@ -107,7 +125,7 @@ public final class Store implements Closeable {
             MemTable memtable = new MemTable();
             WriteAheadLog.Opened opened =
                     WriteAheadLog.open(real.resolve(LOG_FILE), options.recovery(), r -> apply(memtable, r), wrapLog);
-            return new Store(real, options, lockChannel, lock, opened.log(), memtable, opened.recovery());
+            return new Store(real, identity, options, lockChannel, lock, opened.log(), memtable, opened.recovery());
         } catch (IOException | RuntimeException | Error e) {
             if (lockChannel != null) {
                 try {
@@ -116,9 +134,19 @@ public final class Store implements Closeable {
                     e.addSuppressed(suppressed);
                 }
             }
-            OPEN_IN_THIS_JVM.remove(real);
+            OPEN_IN_THIS_JVM.remove(identity);
             throw e;
         }
+    }
+
+    /**
+     * What identifies a directory however it is reached: its file key (device and inode, on Linux
+     * and macOS), or its real path where the platform has none. Real paths alone aren't enough: a
+     * macOS firmlink or a Linux bind mount gives one directory two of them.
+     */
+    private static Object identity(Path real) throws IOException {
+        Object key = Files.readAttributes(real, BasicFileAttributes.class).fileKey();
+        return key != null ? key : real;
     }
 
     /** Creates the directory if needed, and then forces its parent so the new entry survives a crash. */
@@ -256,7 +284,7 @@ public final class Store implements Closeable {
                     try {
                         lockChannel.close();
                     } finally {
-                        OPEN_IN_THIS_JVM.remove(dir);
+                        OPEN_IN_THIS_JVM.remove(identity);
                     }
                 }
             }

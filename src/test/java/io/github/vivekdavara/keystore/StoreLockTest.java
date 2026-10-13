@@ -4,6 +4,7 @@ import static io.github.vivekdavara.keystore.Bytes.utf8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -39,6 +40,27 @@ class StoreLockTest {
             assertEquals(dir.toRealPath(), store.directory());
         } finally {
             Files.delete(link);
+        }
+    }
+
+    /**
+     * One directory can have two real paths: macOS's firmlinks make /private/var/... also
+     * /System/Volumes/Data/private/var/..., and toRealPath keeps them apart (a Linux bind mount is
+     * the same). Found by review: keyed by real path, the second open got past the set, its failed
+     * lock attempt closed a channel on LOCK, and that released the first store's lock.
+     */
+    @Test
+    void aSecondRealPathToTheSameDirectoryIsTheSameStore() throws Exception {
+        Path real = dir.toRealPath();
+        Path alias = Path.of("/System/Volumes/Data" + real);
+        assumeTrue(Files.isDirectory(alias), "needs a second path to the directory (a macOS firmlink)");
+        assumeTrue(!alias.toRealPath().equals(real) && Files.isSameFile(alias, real));
+        try (Store store = Store.open(dir)) {
+            StoreLockedException refused = assertThrows(StoreLockedException.class, () -> Store.open(alias));
+            // Refused by the set (keyed by file key), before the lock file was touched.
+            assertTrue(refused.getMessage().endsWith("is already open in this process"), refused.getMessage());
+            assertEquals("locked", probe(dir), "the first store's lock still holds");
+            store.put(utf8("k"), utf8("v"));
         }
     }
 

@@ -7,6 +7,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -60,6 +64,42 @@ class StoreLockTest {
             // Refused by the set (keyed by file key), before the lock file was touched.
             assertTrue(refused.getMessage().endsWith("is already open in this process"), refused.getMessage());
             assertEquals("locked", probe(dir), "the first store's lock still holds");
+            store.put(utf8("k"), utf8("v"));
+        }
+    }
+
+    /** Found by review: an open store's directory, renamed, has a new real path but is the same store. */
+    @Test
+    void aRenamedOpenDirectoryIsStillTheSameStore() throws Exception {
+        Path before = dir.resolve("before");
+        Path after = dir.resolve("after");
+        try (Store store = Store.open(before)) {
+            store.put(utf8("k"), utf8("v"));
+            Files.move(before, after); // the store keeps writing through its open channels
+            StoreLockedException refused = assertThrows(StoreLockedException.class, () -> Store.open(after));
+            assertTrue(refused.getMessage().endsWith("is already open in this process"), refused.getMessage());
+            assertEquals("locked", probe(after));
+        }
+        assertEquals("opened 1", probe(after));
+    }
+
+    /**
+     * Found by review: Store loaded by a second class loader has a set of its own, which can't know
+     * the first store. Its open reaches tryLock, which the JDK refuses (its lock table is per JVM), and
+     * the channel must then stay open: closing it would release the first store's lock. This is the
+     * one portable way to reach that path.
+     */
+    @Test
+    void aSecondClassLoadersOpenLeavesTheLockHeld() throws Exception {
+        URL classes = Store.class.getProtectionDomain().getCodeSource().getLocation();
+        try (Store store = Store.open(dir);
+                URLClassLoader other = new URLClassLoader(new URL[] {classes}, null)) {
+            Class<?> otherStore = Class.forName(Store.class.getName(), true, other);
+            Method open = otherStore.getMethod("open", Path.class);
+            InvocationTargetException refused = assertThrows(InvocationTargetException.class, () -> open.invoke(null, dir));
+            assertEquals(StoreLockedException.class.getName(), refused.getCause().getClass().getName());
+            assertTrue(refused.getCause().getMessage().endsWith("by another path"), refused.getCause().getMessage());
+            assertEquals("locked", probe(dir));
             store.put(utf8("k"), utf8("v"));
         }
     }

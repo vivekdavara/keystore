@@ -162,7 +162,8 @@ A length outside that range can only be damage, and a reader rejects it before r
 
 **Why CRC32C.** It detects every burst error up to 32 bits and, for random damage, misses with probability 2^-32.
 `java.util.zip.CRC32C` uses the CPU's CRC instructions (ARMv8 here, SSE 4.2 on x86), so the checksum costs little
-next to the write. The checksum covers the length too, so a damaged length is caught even in the unlikely case that
+next to the write. (Checked here: `java -XX:+UnlockDiagnosticVMOptions -XX:+PrintFlagsFinal -version` shows
+`UseCRC32CIntrinsics = true`, and `sysctl hw.optional.armv8_crc32` is 1.) The checksum covers the length too, so a damaged length is caught even in the unlikely case that
 the bytes it points to happen to form a valid payload.
 
 **A record that passes its checksum is also checked for structure**: a known op, lengths within the limits, and
@@ -172,7 +173,7 @@ as damage.
 ### Appending
 
 The log is a file opened for writing at its end. A record is encoded into one buffer and written with a loop over
-`FileChannel.write` until every byte is out (one write call for any record that fits the OS's buffers). Under
+`FileChannel.write` until every byte is out (for a regular file that is usually one call). Under
 `EVERY_WRITE` the store then calls `force(false)`: `fdatasync` on Linux, which also persists the file's length when
 it grew; on macOS the JDK issues `fcntl(F_FULLFSYNC)`, which flushes the drive's own cache, where a plain `fsync`
 does not. That last claim is checked, not assumed: in this machine's JDK (Homebrew OpenJDK 21.0.12),
@@ -212,13 +213,13 @@ When the store creates the log, it also forces the directory, so the file's dire
      writes would be lost by stopping here. What happens depends on `RecoveryMode`:
      - `TOLERATE_TORN_TAIL` (the default) refuses to open: `WalCorruptionException` with the offset of the damage
        and what was found after it. An operator can inspect the log and then choose to drop the rest.
-     - `POINT_IN_TIME` opens with the state as of the last good record, truncates the log there, and reports how
-       many intact records it dropped.
+     - `POINT_IN_TIME` opens with the state as of the last good record, truncates the log there, and reports the
+       bytes it dropped and the first intact record it found after the damage. (`keystore dump` lists them all.)
 5. Truncation is forced before any new record is appended. Otherwise a crash after new appends could leave the old
    bytes beyond the new records, and a later recovery would find them.
 
-`Store.open` returns a `Recovery` report: records replayed, the last sequence number, bytes truncated, and the
-outcome (clean, torn tail, damage dropped).
+`Store.recovery()` returns the report of the open: the outcome (clean, torn tail, damage dropped), records
+replayed, the last sequence number, bytes kept and bytes truncated, and what was wrong.
 
 ### Why fail closed by default
 
@@ -229,9 +230,10 @@ refusal costs an operator a decision; a false "torn tail" would silently drop ac
 power loss can legitimately leave intact records after a torn one, so with `NEVER`, `POINT_IN_TIME` is the
 sensible mode.
 
-The scan reads every byte offset after the damage but only computes a checksum where a plausible length sits, so it
-is linear in the size of the tail in practice. A false match needs a plausible length, a 1-in-2^32 checksum match
-and a valid structure all at once.
+The scan visits every byte offset after the damage, but checks the cheap fields first (a plausible length, a known
+op, a key length and a value length that fill the payload exactly) and computes a checksum only where all of them
+pass, so on zeros or random bytes it costs a few comparisons per offset (README, "Results"). A false match needs
+all those fields and a 1-in-2^32 checksum match at once.
 
 ### Sequence numbers in recovery
 

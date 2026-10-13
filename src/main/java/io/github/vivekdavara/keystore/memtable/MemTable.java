@@ -13,14 +13,15 @@ import java.util.Map;
  */
 public final class MemTable {
     /**
-     * Bytes charged per key on top of its key and value: the node, its next pointers, the entry and
-     * the two array headers, roughly, on a 64-bit JVM with compressed pointers.
+     * Bytes charged per key on top of its key and value: the node with its array of next pointers
+     * and the entry (64 bytes on a 64-bit JVM with compressed pointers, measured with
+     * {@code Bench memory}), plus the two arrays' 16-byte headers. Exact for keys and values whose
+     * lengths are multiples of 8; otherwise low by the arrays' padding, at most 14 bytes.
      */
     static final int PER_KEY_OVERHEAD = 96;
 
     private final SkipList<byte[], Entry> entries;
     private volatile long approximateBytes;
-    private volatile long bytesWritten;
     private volatile long lastSeq;
 
     public MemTable() {
@@ -48,7 +49,6 @@ public final class MemTable {
         } else {
             approximateBytes += entry.valueLength() - previous.valueLength();
         }
-        bytesWritten += key.length + entry.valueLength();
         lastSeq = seq;
     }
 
@@ -73,19 +73,12 @@ public final class MemTable {
     }
 
     /**
-     * What the memtable holds now, roughly: its keys and current values plus a per-key overhead. An
-     * overwrite replaces the old value, so this can stay small while {@link #bytesWritten} grows.
+     * The heap the memtable holds now, roughly: its keys and current values plus a per-key overhead.
+     * An overwrite replaces the old value, so this stays small while the log grows: the flush
+     * (day 2) must be triggered by the log's size, not by this.
      */
     public long approximateBytes() {
         return approximateBytes;
-    }
-
-    /**
-     * Key and value bytes of every write applied, overwrites included. This tracks the log's growth,
-     * which is what a flush must bound.
-     */
-    public long bytesWritten() {
-        return bytesWritten;
     }
 
     /** The sequence number of the last write applied, or 0. */

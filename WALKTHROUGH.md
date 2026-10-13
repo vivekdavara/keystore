@@ -68,9 +68,10 @@ There are no snapshots yet, so old versions would only cost memory. The swap is 
 (user key, sequence number), as in LevelDB.
 
 **What's the catch with in-place overwrites?**
-A million overwrites of one key leave a tiny memtable and a huge log. So `MemTable` tracks `bytesWritten` (every
-write) as well as `approximateBytes` (what it holds), and day 2's flush trigger must use the first
-(`MemTableTest.overwritesKeepTheTableSmallButTheWrittenCountGrows`).
+A million overwrites of one key leave a tiny memtable and a huge log, so day 2's flush must be triggered by the
+log's size, not the memtable's (`StoreTest.overwritesGrowTheLogNotTheMemtable`). A first version counted "bytes
+written" in the memtable; a review measured it 22 times too small for 1-byte deletes, since it left out each
+record's framing, and it was removed: the log's own size is exact.
 
 ## The log and recovery
 

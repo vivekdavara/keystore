@@ -10,6 +10,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.github.vivekdavara.keystore.wal.Recovery.Outcome;
 import io.github.vivekdavara.keystore.wal.RecoveryMode;
 import io.github.vivekdavara.keystore.wal.WalCorruptionException;
+import io.github.vivekdavara.keystore.wal.WalFormat;
+import io.github.vivekdavara.keystore.wal.WalRecord;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
@@ -204,6 +206,24 @@ class StoreTest {
         }
         try (Store store = Store.open(dir)) {
             assertEquals(Outcome.CLEAN, store.recovery().outcome(), "the drop was made permanent");
+        }
+    }
+
+    /**
+     * Overwrites replace the memtable's entry but add to the log, so the log, not the memtable, is
+     * what the flush (day 2) must bound. Found by review: the memtable's own count of bytes written
+     * left out each record's 21 to 25 bytes of framing, 22 times too small for 1-byte deletes, so
+     * it is gone, and the log's size is the measure.
+     */
+    @Test
+    void overwritesGrowTheLogNotTheMemtable() throws IOException {
+        try (Store store = Store.open(dir, Options.defaults().withSync(SyncPolicy.NEVER))) {
+            byte[] value = new byte[100];
+            for (int i = 0; i < 10_000; i++) {
+                store.put(utf8("hot"), value);
+            }
+            assertEquals(1, store.memtableSize());
+            assertEquals(10_000L * WalFormat.encodedSize(WalRecord.put(1, utf8("hot"), value)), store.logSize());
         }
     }
 

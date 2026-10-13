@@ -80,23 +80,20 @@ class MemTableTest {
     }
 
     @Test
-    void sizesCountNewKeysReplacementsAndEveryWrite() {
+    void theSizeCountsNewKeysAndReplacements() {
         MemTable table = new MemTable();
         table.put(1, utf8("key"), new byte[10]);
         assertEquals(3 + 10 + MemTable.PER_KEY_OVERHEAD, table.approximateBytes());
-        assertEquals(13, table.bytesWritten());
 
         table.put(2, utf8("key"), new byte[4]); // a smaller value replaces the old one
         assertEquals(3 + 4 + MemTable.PER_KEY_OVERHEAD, table.approximateBytes());
-        assertEquals(13 + 7, table.bytesWritten());
 
         table.delete(3, utf8("key")); // a tombstone holds no value
         assertEquals(3 + MemTable.PER_KEY_OVERHEAD, table.approximateBytes());
-        assertEquals(13 + 7 + 3, table.bytesWritten());
     }
 
     @Test
-    void overwritesKeepTheTableSmallButTheWrittenCountGrows() {
+    void overwritesKeepTheTableSmall() {
         MemTable table = new MemTable();
         byte[] value = new byte[100];
         for (int seq = 1; seq <= 10_000; seq++) {
@@ -104,7 +101,6 @@ class MemTableTest {
         }
         assertEquals(1, table.size());
         assertEquals(3 + 100 + MemTable.PER_KEY_OVERHEAD, table.approximateBytes());
-        assertEquals(10_000L * 103, table.bytesWritten());
     }
 
     @Test

@@ -135,10 +135,14 @@ becomes (user key, sequence number), as in LevelDB).
 `ConcurrentSkipListMap`'s: it sees each key's entry as of the moment it visits it. Day 2's flush iterates a memtable
 no one writes to any more, so it sees a fixed state.
 
-**Size.** The memtable counts the bytes of its keys and current entries plus a fixed per-node overhead
-(`approximateBytes`), and also the bytes written to it in total (`bytesWritten`). They differ because an overwrite
-replaces the entry: a million overwrites of one key leave a tiny memtable and a large log. Day 2's flush trigger
-must use the bytes written, or the log grows without bound.
+**Size.** The memtable counts the bytes of its keys and current values plus a fixed overhead per key
+(`approximateBytes`). The overhead, 96 bytes, is measured (`Bench memory`): 64 bytes of node, next-pointer array
+and entry, plus the key's and value's 16-byte array headers; it is exact for lengths that are multiples of 8 and
+otherwise low by the arrays' padding. An overwrite replaces the entry, so a million overwrites of one key leave a
+tiny memtable and a large log: day 2's flush must be triggered by the log's size (`Store.logSize()`, which counts
+every record and its framing), not by the memtable's. A review found that an earlier count of "bytes written" kept
+in the memtable left out the framing, 21 to 25 bytes a record, and was 22 times too small for 1-byte deletes; it
+was removed.
 
 ## The write-ahead log (day 1)
 
@@ -297,7 +301,7 @@ the damage, which `POINT_IN_TIME` would drop, so the operator can decide with th
 ## Plan for days 2–5
 
 - **Day 2: SSTables and compaction.**
-  - When the memtable's `bytesWritten` passes a threshold, freeze it, start a new log and memtable, and flush the
+  - When the log passes a size threshold, freeze the memtable, start a new log and memtable, and flush the
     frozen one to an SSTable: sorted data blocks, a sparse index (one key per block), a Bloom filter over the keys,
     a footer with offsets and a checksum.
   - A manifest records the live SSTables and the sequence number they cover; a log is deleted only after its

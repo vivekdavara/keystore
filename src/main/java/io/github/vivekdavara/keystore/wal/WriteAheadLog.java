@@ -114,6 +114,15 @@ public final class WriteAheadLog implements Closeable {
     }
 
     /**
+     * Closes the log without forcing it, for a log whose append or flush failed: its state is
+     * unknown, a flush after a failed one proves nothing, and the channel may already be closed (an
+     * interrupt closes it).
+     */
+    public void abandon() throws IOException {
+        channel.close();
+    }
+
+    /**
      * Forces a directory, so a file just created in it is still there after a crash. Linux and macOS
      * allow this through a channel opened for reading.
      */

@@ -232,7 +232,8 @@ public final class Store implements Closeable {
 
     /**
      * Forces the log, closes it and releases the directory. Waits for a write in progress. Calls
-     * after this fail with {@link IllegalStateException}; closing again does nothing.
+     * after this fail with {@link IllegalStateException}; closing again does nothing. A store whose
+     * writes failed closes its log without forcing it.
      */
     @Override
     public void close() throws IOException {
@@ -243,7 +244,11 @@ public final class Store implements Closeable {
             }
             closed = true;
             try {
-                log.close();
+                if (failure == null) {
+                    log.close();
+                } else {
+                    log.abandon();
+                }
             } finally {
                 try {
                     lock.release();

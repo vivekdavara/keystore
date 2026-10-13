@@ -122,9 +122,15 @@ wrote before that link: the key, the entry and the node's own pointers. A reader
 half-built node. It may see the node on level 0 but not yet on level 2; it then finds it by going down, which is only
 slower. Nodes are never removed, so a reader never follows a pointer into a node that's gone.
 
+Bottom-up linking isn't needed for a reader to see a whole node (the node is complete before any link), but it is
+needed for visibility to be monotonic: once any search can find the node, on any level, it is on level 0, so every
+later search and every later iteration finds it too. Linked top-down, a `get` could find a key through an upper
+level that an iteration starting after the `get` returned would miss, while the put was still in progress.
+
 The list's height is a volatile too. The writer raises it before linking the new node in at the new levels, so a
 reader may see the new height and a null next pointer at the head's top level; it treats null as "past the end" and
-goes down, which is correct.
+goes down, which is correct. (A reader that saw a stale, lower height would just start lower, so the volatile is for
+clarity, not for safety.)
 
 **Overwrites replace the entry in place.** A put for a key that's already there swaps the node's entry (one volatile
 write of an immutable `Entry`), so a reader sees the old entry or the new one, never a mix. The memtable keeps only
@@ -185,7 +191,16 @@ does not. That last claim is checked, not assumed: in this machine's JDK (Homebr
 `0x33` (51, `F_FULLFSYNC`), and falling back to `fsync` only when that fails on a filesystem that isn't local. It
 is why a forced write costs milliseconds here (README, "Results").
 
-When the store creates the log, it also forces the directory, so the file's directory entry survives a crash.
+Every open forces the log's directory, so the file's directory entry survives a crash. That's every open, not only
+the one that created the file: a crash between creating it and forcing the directory would otherwise leave the
+entry unforced for good (a review found that). When `Store.open` creates the store's directory, and any missing
+directories above it, it forces the parent of each one it created, top down.
+
+**A limit on the log's size.** Recovery reads the log whole, into one array, so it can't read back more than about
+2 GiB (`WriteAheadLog.MAX_RECOVERABLE_BYTES`). A write that would take the log past `Options.maxLogBytes` (at most
+that, and that by default) is refused with `LogFullException` before anything is written, and the store goes on.
+Before a review found it, the store acknowledged writes past the limit and then couldn't reopen. Day 2's log
+rotation makes the limit a formality.
 
 ## Recovery (day 1)
 
@@ -212,13 +227,17 @@ When the store creates the log, it also forces the directory, so the file's dire
 4. Otherwise, look at everything after the first bad record: try to decode an intact record at every byte offset
    after the bad record's start.
    - **No intact record anywhere after it: a torn tail.** This is what a crash leaves. Truncate the file to the end
-     of the last good record, force it, and open. Nothing acknowledged was lost under `EVERY_WRITE`.
+     of the last good record, force it, and open. If a crash caused it, nothing acknowledged was lost under
+     `EVERY_WRITE`. Damage that happens to reach the end of the log (zeroed sectors over the last ten records, say)
+     looks exactly the same and is dropped the same way, however many records it covers; see "Limitations".
    - **An intact record after it: damage in the middle.** Records written after the damage exist, so acknowledged
      writes would be lost by stopping here. What happens depends on `RecoveryMode`:
      - `TOLERATE_TORN_TAIL` (the default) refuses to open: `WalCorruptionException` with the offset of the damage
        and what was found after it. An operator can inspect the log and then choose to drop the rest.
      - `POINT_IN_TIME` opens with the state as of the last good record, truncates the log there, and reports the
        bytes it dropped and the first intact record it found after the damage. (`keystore dump` lists them all.)
+   - **Undecided: the scan ran out of its budget** (below). Treated as damage in the middle, since recovery can't
+     rule out writes after it: the default refuses, `POINT_IN_TIME` drops the rest.
 5. Truncation is forced before any new record is appended. Otherwise a crash after new appends could leave the old
    bytes beyond the new records, and a later recovery would find them.
 
@@ -236,8 +255,15 @@ sensible mode.
 
 The scan visits every byte offset after the damage, but checks the cheap fields first (a plausible length, a known
 op, a key length and a value length that fill the payload exactly) and computes a checksum only where all of them
-pass, so on zeros or random bytes it costs a few comparisons per offset (README, "Results"). A false match needs
-all those fields and a 1-in-2^32 checksum match at once.
+pass, so on zeros or random bytes it costs a few comparisons per offset (README, "Results": about a millisecond per
+megabyte). A false match needs all those fields and a 1-in-2^32 checksum match at once.
+
+**The scan's budget.** A review found the worst case: a value that repeats a 26-byte fake header (a put of length
+L, key length 1, value length L - 18) passes the cheap checks at every repeat, and each one costs a checksum over L
+bytes, so the scan is quadratic. A 4 MiB value torn by a crash took 16.9 s to recover (reproduced here), a 16 MiB one
+275 s in the review's run, and any client can store such a value. So the scan charges every checksummed byte to a budget of four
+times the tail plus 1 MiB. Zeros, random bytes and real records use almost none of it. When it runs out, the scan
+is undecided, and recovery fails closed as above; the 4 MiB case is now decided in 0.03 s.
 
 ### Sequence numbers in recovery
 
@@ -254,24 +280,41 @@ is intact but in the wrong place (old bytes left beyond a truncation, say); the 
 - **The outcome of a failed write is unknown.** The caller got an exception, but the record may have reached the
   device; if it did, recovery replays it. This is the same as any timeout in a distributed system, and it's why
   replication (day 3) identifies writes by sequence number.
+- **`lastSequence()` names only writes reads can see.** It advances after the write is applied to the memtable, so
+  under `EVERY_WRITE` it is also durable. A review found it advancing right after the append, while the write was
+  still being forced and invisible. A write whose flush failed is never counted; if it reached the device, the
+  reopened store counts it.
 - **One process at a time.** `Store.open` takes `LOCK` with `FileChannel.tryLock`; a second open fails at once
   with `StoreLockedException`, in another process or in the same JVM. The same-JVM case needs care. These are POSIX
   record locks: they belong to the process, not to a channel, and closing *any* descriptor for the file releases
   all of them. A second open that opened `LOCK`, failed to lock it (Java reports `OverlappingFileLockException`)
   and closed its channel would silently release the first store's lock, and another process could then open the
-  directory while the first store is still writing. So the store keeps a JVM-wide set of open directories (by real
-  path, so a symlink or a `..` path is the same directory) and refuses a second open before touching `LOCK`. Lucene's
-  `NativeFSLockFactory` keeps the same kind of set for the same reason. A test runs a child JVM to show the lock
-  holds after a refused second open; without the set, the child opens the directory.
+  directory while the first store is still writing. So the store keeps a JVM-wide set of open directories and
+  refuses a second open before touching `LOCK`. Lucene's `NativeFSLockFactory` keeps the same kind of set for the
+  same reason. A test runs a child JVM to show the lock holds after a refused second open; without the set, the
+  child opens the directory.
+
+  The set is keyed by the directory's file key (device and inode), not its path. A review found that real paths
+  aren't enough: one directory can have two (a macOS firmlink, `/System/Volumes/Data/private/var/...` for
+  `/private/var/...`; a Linux bind mount; a rename while the store is open), and the second open slipped past a
+  path-keyed set into the trap. As a second defence, if `tryLock` reports a lock this JVM already holds
+  (`OverlappingFileLockException`), that channel is kept open for the life of the JVM rather than closed. That
+  happens when the class is loaded twice, by two class loaders, each with a set of its own.
 - **An interrupted writer stops the store's writes.** `FileChannel` is an interruptible channel: if a thread is
   interrupted while in (or entering) a channel operation, the JDK closes the channel and throws
   `ClosedByInterruptException`. The log's channel is shared, so one interrupted writer fails the store as above,
   and every later write gets `StoreFailedException` until a reopen; reads go on. Callers must not interrupt
   threads that write. The fix is to do the log's I/O on a thread of its own, which group commit (day 4) needs anyway.
-- **Close** forces the log (whatever the sync policy), closes it and releases the lock. Calls after `close` fail
-  with `IllegalStateException`. `close` waits for a write in progress, since it takes the write lock. A store whose
-  writes failed closes its log without forcing it: a flush after a failed one proves nothing, and after an
-  interrupt the channel is already closed.
+- **Close** forces the log (whatever the sync policy), closes it and releases the lock, so when it returns every
+  acknowledged write is on the device. `put`, `delete` and `get` after `close` fail with `IllegalStateException`;
+  the accessors (`lastSequence()` and the rest) still answer. `close` waits for a write in progress, since it takes
+  the write lock. A store whose writes failed:
+  - after a failed flush (only `EVERY_WRITE` flushes on writes), every write acknowledged before it was forced on
+    its own, and a second flush proves nothing, so the log is closed as it is;
+  - after a failed append, the log is still forced, because under `NEVER` the acknowledged writes before it need
+    it (the partial record goes along; recovery drops it). A review found close skipping this force;
+  - if the channel is gone (an interrupt closed it), nothing can be forced; under `NEVER` close then throws
+    `StoreFailedException`, since acknowledged writes may not be on the device. The directory is released anyway.
 
 **Inspecting a log.** `keystore dump DIR` (README, "Run it") reads the log without changing it, lists every record
 with its offset, and says what recovery would do. For a log the default refuses, it lists the intact records after
@@ -293,10 +336,23 @@ the damage, which `POINT_IN_TIME` would drop, so the operator can decide with th
   sequence records.
 - **The store.** Put, get and delete through reopen, both sync policies, the lock (with a child JVM), and failures:
   a log channel that fails a write partway or fails a flush on demand (`FaultyChannel`), and an interrupted writer.
-- **Do the tests fail when they should?** Each mechanism below was removed (in a copy of the file) to check that a
-  test fails without it: linking a skip list node before filling it in (all 3 runs of the concurrency test fail
-  within 0.2 s), the JVM-wide set of open directories (the child JVM opens a directory that is still open), marking
-  the store failed after an error (5 of 5 fault tests fail), and closing a failed log without forcing it (3 of 5).
+- **Do the tests fail when they should?** Each mechanism below was removed (in a copy of the file, restored after)
+  to check that a test fails without it:
+  - the skip list: linking a node before filling it in (all 3 runs of the concurrency test fail within 0.2 s, on
+    both the `AtomicReferenceArray` and the `VarHandle` versions), not replacing a value in place, linking a node
+    on level 0 only;
+  - the lock: the set of open directories, its file key (the firmlink test), keeping an overlapping channel open
+    (the class-loader test);
+  - failures: marking the store failed after an error, each branch of close after a failure, close's write lock,
+    `lastSequence()` advancing only after the apply, the log's size check;
+  - durability: `EVERY_WRITE`'s force, the truncation's force, the directory forces, closing the channel on a
+    refused open (file descriptors counted through `/dev/fd`);
+  - recovery: the scan's budget (without it, the 4 MiB test takes 16.9 s and wrongly says "torn tail").
+- **What the tests can't show.** A plain write where a volatile one belongs (a link, or a value) passed the
+  concurrency test 100 times in 100 in a review: the counter that makes its checks exact also gives the reader the
+  happens-before edge the missing volatile should have, for every key it checks. Only a node inserted at that very
+  moment could show it, which needs a jcstress-style harness. Those properties rest on the argument in "The
+  memtable". The forces are counted, not crash-tested: nothing here pulls the power.
 
 ## Plan for days 2–5
 
@@ -324,8 +380,15 @@ the damage, which `POINT_IN_TIME` would drop, so the operator can decide with th
 - Recovery reads the whole log file into memory (one array, so at most 2 GiB). Day 2's log rotation keeps each file
   near the memtable's size.
 - Writes are serialised, and under `EVERY_WRITE` each one waits for a device flush; there is no group commit.
-- Damage to the last record is indistinguishable from a torn write, so it is dropped as one, even if that record had
-  been acknowledged.
+- Damage that reaches the end of the log is indistinguishable from a torn write, so it is dropped as one, even if
+  it covers acknowledged records (a review zeroed the last ten records: a "torn tail" of 950 bytes). Under
+  `EVERY_WRITE` a torn write is at most one record, so a tail longer than the largest record (16 MiB and change)
+  can't be one; the check isn't made, because a log written under `NEVER` can legitimately tear more.
+- After a failed flush, a reopen in the same boot reads the record from the page cache, where it looks whole, and
+  later flushes succeed; but on Linux the failed pages may never have reached the device. After a power loss that
+  record becomes damage in the middle of the log. The safe response to a failed flush is to suspect the device.
+- The scan's budget makes recovery refuse, rather than wait, when a torn tail is full of record-like bytes: a crafted
+  value can turn an ordinary crash into a refusal (`POINT_IN_TIME` opens it).
 - A value that contains an encoded log record can make recovery refuse to open after an ordinary crash (see "Why
   fail closed by default"). `POINT_IN_TIME` opens it.
 - No snapshots or range scans in the API yet; the memtable can iterate, for the flush.

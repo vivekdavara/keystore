@@ -158,8 +158,9 @@ public final class SkipList<K, V> implements Iterable<Map.Entry<K, V>> {
 
     /**
      * Checks the structure, for tests, when no writer is running: every level is strictly sorted,
-     * every node on a level is also on the level below, level 0 holds {@link #size} nodes, and no
-     * level above the height is in use. Returns how many nodes are on each level.
+     * every node on a level is also on the level below, every node is on each of its levels, level 0
+     * holds {@link #size} nodes, and no level above the height is in use. Returns how many nodes are
+     * on each level.
      */
     int[] checkInvariants() {
         int[] counts = new int[MAX_HEIGHT];
@@ -194,6 +195,19 @@ public final class SkipList<K, V> implements Iterable<Map.Entry<K, V>> {
         }
         if (counts[0] != size) {
             throw new AssertionError("level 0 has " + counts[0] + " nodes but size is " + size);
+        }
+        // A node built h levels high must be linked on all h of them.
+        int[] tall = new int[MAX_HEIGHT];
+        for (Node<K, V> node = head.next(0); node != null; node = node.next(0)) {
+            for (int level = 0; level < node.next.length; level++) {
+                tall[level]++;
+            }
+        }
+        for (int level = 0; level < MAX_HEIGHT; level++) {
+            if (tall[level] != counts[level]) {
+                throw new AssertionError(tall[level] + " nodes are " + (level + 1) + " or more levels high, but "
+                        + counts[level] + " are linked on level " + level);
+            }
         }
         return counts;
     }

@@ -20,8 +20,13 @@ import org.junit.jupiter.api.RepeatedTest;
 /**
  * One writer, several readers, no locks. The writer publishes how far it has got through an
  * {@link AtomicInteger}; a reader reads it first, which gives the reader a happens-before edge with
- * every insert before that point. So a reader that misses such a key, sees a wrong value, or
- * iterates out of order has found a real bug, not a timing accident.
+ * every insert and replacement before that point. So a reader that misses such a key, sees a value
+ * older than one it must see, or iterates out of order has found a real bug, not a timing accident.
+ *
+ * <p>What it can't catch: a missing volatile (a plain write where a volatile one belongs). The same
+ * counter that makes the checks exact also covers up a missing edge for every key it checks; only a
+ * node inserted at that very moment could show one. That needs a jcstress-style harness, so those
+ * properties rest on the argument in DESIGN.md.
  */
 class SkipListConcurrencyTest {
     private static final int KEYS = 200_000;
@@ -30,6 +35,10 @@ class SkipListConcurrencyTest {
     @RepeatedTest(3)
     void readersSeeEveryInsertTheWriterHadFinished() throws Exception {
         int[] keys = shuffled(KEYS, new SplittableRandom(42));
+        int[] indexOf = new int[KEYS + 1];
+        for (int i = 0; i < KEYS; i++) {
+            indexOf[keys[i]] = i;
+        }
         SkipList<Integer, Integer> list = new SkipList<>(Comparator.naturalOrder());
         AtomicInteger published = new AtomicInteger(-1); // index of the last finished step
         AtomicReference<String> failure = new AtomicReference<>();
@@ -45,7 +54,7 @@ class SkipListConcurrencyTest {
                     while (failure.get() == null) {
                         int upTo = published.get();
                         if (iterates) {
-                            checkIteration(list, upTo, failure);
+                            checkIteration(list, indexOf, upTo, failure);
                         } else {
                             checkGets(list, keys, upTo, random, failure);
                         }
@@ -79,7 +88,23 @@ class SkipListConcurrencyTest {
         assertTrue(checks.get() >= READERS, "every reader checked at least once");
     }
 
-    /** Every key finished by step upTo is found, with its value or its replacement. */
+    /**
+     * Whether {@code value} is one key {@code index} may have once step {@code upTo} is published.
+     * Step i (when i % 4 == 3) replaces the key at index i / 2, so a key at an odd index j is
+     * replaced at step 2j + 1: from then on only the replacement will do. Even indices are never
+     * replaced. Before its replacement step, either value is possible (it may be in flight).
+     */
+    static boolean allowed(int key, int index, int upTo, Integer value) {
+        if (value == null) {
+            return false;
+        }
+        if (index % 2 == 0) {
+            return value == key;
+        }
+        return 2 * index + 1 <= upTo ? value == -key : Math.abs(value) == key;
+    }
+
+    /** Every key finished by step upTo is found, with exactly the value it must have by then. */
     private static void checkGets(
             SkipList<Integer, Integer> list, int[] keys, int upTo, SplittableRandom random,
             AtomicReference<String> failure) {
@@ -87,9 +112,10 @@ class SkipListConcurrencyTest {
             return;
         }
         for (int probe = 0; probe < 200; probe++) {
-            int key = keys[random.nextInt(upTo + 1)];
+            int index = random.nextInt(upTo + 1);
+            int key = keys[index];
             Integer value = list.get(key);
-            if (value == null || Math.abs(value) != key) {
+            if (!allowed(key, index, upTo, value)) {
                 failure.compareAndSet(null, "get(" + key + ") = " + value + " after step " + upTo);
                 return;
             }
@@ -99,8 +125,12 @@ class SkipListConcurrencyTest {
         }
     }
 
-    /** Iteration is strictly sorted and reaches at least every key finished by step upTo. */
-    private static void checkIteration(SkipList<Integer, Integer> list, int upTo, AtomicReference<String> failure) {
+    /**
+     * Iteration is strictly sorted, reaches at least every key finished by step upTo, and shows each
+     * key with a value it may have by then.
+     */
+    private static void checkIteration(
+            SkipList<Integer, Integer> list, int[] indexOf, int upTo, AtomicReference<String> failure) {
         int count = 0;
         int last = Integer.MIN_VALUE;
         for (Map.Entry<Integer, Integer> entry : list) {
@@ -109,8 +139,8 @@ class SkipListConcurrencyTest {
                 failure.compareAndSet(null, "iteration went from " + last + " to " + key);
                 return;
             }
-            if (Math.abs(entry.getValue()) != key) {
-                failure.compareAndSet(null, "iteration saw " + key + " = " + entry.getValue());
+            if (!allowed(key, indexOf[key], upTo, entry.getValue())) {
+                failure.compareAndSet(null, "iteration saw " + key + " = " + entry.getValue() + " after step " + upTo);
                 return;
             }
             last = key;

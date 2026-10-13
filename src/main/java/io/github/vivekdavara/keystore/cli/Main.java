@@ -14,7 +14,7 @@ import java.util.Optional;
  *
  * <pre>
  * keystore put DIR KEY VALUE    set KEY to VALUE (UTF-8)
- * keystore get DIR KEY          print KEY's value; exit 1 if there is none
+ * keystore get DIR KEY          print KEY's value; exit 1 if there is none (or no store)
  * keystore delete DIR KEY       delete KEY
  * keystore dump DIR             list the log's records and what recovery would do; changes nothing
  * </pre>
@@ -48,14 +48,19 @@ public final class Main {
             return 2;
         }
         Path dir = Path.of(args[1]);
+        Path log = dir.resolve("wal.log");
         try {
             if (command.equals("dump")) {
-                Path log = dir.resolve("wal.log");
                 if (!Files.exists(log)) {
                     err.println("keystore: no log at " + log);
                     return 1;
                 }
                 return WalDump.dump(log, out) == WalDump.Verdict.REFUSED ? 3 : 0;
+            }
+            if (command.equals("get") && !Files.exists(log)) {
+                // Opening would create a store there; a read shouldn't create anything.
+                err.println("keystore: no store at " + dir);
+                return 1;
             }
             try (Store store = Store.open(dir)) {
                 byte[] key = Bytes.utf8(args[2]);

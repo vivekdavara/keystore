@@ -44,6 +44,17 @@ class MainTest {
     }
 
     @Test
+    void getCreatesNothingWhereThereIsNoStore() {
+        Path elsewhere = dir.resolve("not-a-store");
+        assertEquals(1, run("get", elsewhere.toString(), "k"));
+        assertEquals("keystore: no store at " + elsewhere + "\n", err);
+        assertTrue(Files.notExists(elsewhere));
+        assertEquals(1, run("get", dir.toString(), "k")); // a directory, but not a store
+        assertTrue(Files.notExists(dir.resolve("wal.log")));
+        assertTrue(Files.notExists(dir.resolve("LOCK")));
+    }
+
+    @Test
     void badUsageExitsWithTwo() {
         assertEquals(2, run());
         assertTrue(err.startsWith("usage: keystore put DIR KEY VALUE"), err);

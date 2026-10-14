@@ -197,6 +197,16 @@ class StoreTablesTest {
         assertEquals(tables, files(".sst"), "nothing was deleted");
     }
 
+    /** A day-1 directory (one wal.log, no manifest) is refused too, not taken for a new store. */
+    @Test
+    void aDayOneDirectoryIsRefused() throws IOException {
+        Files.createDirectories(dir);
+        Files.write(dir.resolve("wal.log"), new byte[] {1, 2, 3});
+        IOException refused = assertThrows(IOException.class, () -> Store.open(dir, SMALL));
+        assertTrue(refused.getMessage().contains("no MANIFEST"), refused.getMessage());
+        assertFalse(Files.exists(dir.resolve(Manifest.FILE)), "nothing was written");
+    }
+
     @Test
     void aDamagedTableRefusesToOpenTheStore() throws IOException {
         try (Store store = Store.open(dir, SMALL)) {

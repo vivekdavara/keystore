@@ -128,4 +128,48 @@ class MainTest {
                 + " bytes, including the 2 intact records above"), out);
         assertArrayEquals(bytes, Files.readAllBytes(log));
     }
+
+    /** flush writes a table that get reads from; compact merges the tables; dump lists them and the live log. */
+    @Test
+    void flushAndCompactWriteTablesThatDumpLists() throws IOException {
+        String d = dir.toString();
+        run("put", d, "a", "1");
+        assertEquals(0, run("flush", d));
+        run("put", d, "a", "2");
+        run("put", d, "b", "3");
+        assertEquals(0, run("flush", d));
+        assertEquals(0, run("get", d, "a"));
+        assertEquals("2\n", out, "the newer table's value");
+        assertEquals(0, run("dump", d));
+        assertTrue(out.contains("tables cover writes up to #3"), out);
+        assertTrue(out.contains("000003.sst: ") && out.contains("000005.sst: "), out);
+        assertEquals(0, run("compact", d));
+        assertEquals(0, run("dump", d));
+        assertTrue(out.contains("000006.sst: ") && !out.contains("000003.sst") && !out.contains("000005.sst"), out);
+        assertTrue(Files.notExists(dir.resolve("000003.sst")), "the merged inputs are deleted");
+        assertEquals(0, run("get", d, "b"));
+        assertEquals("3\n", out);
+    }
+
+    /**
+     * After a crash during a flush there are two logs; dump lists both. An older log that isn't clean
+     * can't be a torn write (it was closed before the next one started), so dump says the store would
+     * refuse, and exits 3.
+     */
+    @Test
+    void dumpListsEveryLiveLogAndRefusesATornOlderOne() throws IOException {
+        String d = dir.toString();
+        run("put", d, "a", "1");
+        run("put", d, "b", "2");
+        byte[] older = Files.readAllBytes(dir.resolve("000001.log"));
+        Files.write(dir.resolve("000004.log"), new byte[0]); // the new log a flush starts first
+        assertEquals(0, run("dump", d));
+        assertTrue(out.contains("000001.log: ") && out.contains("000004.log: 0 bytes"), out);
+
+        Files.write(dir.resolve("000001.log"), java.util.Arrays.copyOf(older, older.length - 3));
+        assertEquals(3, run("dump", d));
+        assertTrue(out.contains("refused: an older log must be clean"), out);
+        assertEquals(1, run("get", d, "a"));
+        assertTrue(err.contains("older log"), err);
+    }
 }

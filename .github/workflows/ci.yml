@@ -25,8 +25,11 @@ jobs:
       - name: Run the packaged command
         run: |
           scripts/keystore put target/ci-store city Boston
+          scripts/keystore flush target/ci-store
           test "$(scripts/keystore get target/ci-store city)" = Boston
           scripts/keystore delete target/ci-store city
+          scripts/keystore flush target/ci-store
+          scripts/keystore compact target/ci-store
           if scripts/keystore get target/ci-store city; then exit 1; fi
           scripts/keystore dump target/ci-store
       - name: Upload test reports

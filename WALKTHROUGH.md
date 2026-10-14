@@ -294,9 +294,9 @@ table still has one, the deleted value would come back. When nothing older exist
 tombstone goes with it (`StoreTablesTest.compactAllKeepsTheNewestValueAndDropsTombstones`).
 
 **What did the day-2 reviews find?**
-Four bugs, none of them lost an acknowledged write in a test, but two could have returned wrong data. Two swapped
-blocks of equal length passed their checksums and made a lookup answer "not here" (a stale read from an older
-table), fixed by putting the offset in the checksum. A crafted table with valid checksums claimed 2^31 index entries
+Four bugs. None lost an acknowledged write in a test, but one could have returned wrong data: two swapped blocks
+of equal length passed their checksums and made a lookup answer "not here" (a stale read from an older table),
+fixed by putting the offset in the checksum. A crafted table with valid checksums claimed 2^31 index entries
 and ran the reader out of memory, fixed by checking the count against the index's length first. `close()` reported
 possible data loss under `NEVER` after a flush that had already forced everything, fixed by remembering the clean
 rotation. And an undeletable garbage file failed the reopen (I'd found that one too). The second review's sweep test

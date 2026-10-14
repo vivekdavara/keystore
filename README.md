@@ -226,6 +226,11 @@ about six minutes. The first had already written its findings as tests, which I 
 - Its oracle test (random tables over keys on both sides of 0x80, every prefix and extension of every key probed)
   and its maximum-length-key test passed, and are now part of `TableTest`.
 
+Found while building: **one interrupted `get` broke a table for every reader.** `FileChannel` is interruptible, so
+the interrupt closed the table's channel, and every later read of that table failed with `ClosedChannelException`
+until a reopen (a probe showed it). A table now reopens its channel when a read finds it closed while the table is
+still live; the interrupted read still fails.
+
 The second agent left nothing, so it was run again after the limit reset, on failure handling during flushes and
 merges (below, if it found anything).
 
@@ -270,7 +275,8 @@ merges (below, if it found anything).
   many records it covers.
 - A value that holds an encoded log record can make recovery refuse to open after an ordinary crash; the default
   errs on the side of refusing (a test shows the case).
-- Interrupting a writing thread closes the log's channel and stops the store's writes until a reopen.
+- Interrupting a writing thread closes the log's channel and stops the store's writes until a reopen. (An
+  interrupted reader only fails its own read.)
 
 DESIGN.md's "Limitations" has the full list.
 

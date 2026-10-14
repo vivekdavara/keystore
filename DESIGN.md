@@ -521,6 +521,12 @@ is intact but in the wrong place (old bytes left beyond a truncation, say); the 
   `ClosedByInterruptException`. The log's channel is shared, so one interrupted writer fails the store as above,
   and every later write gets `StoreFailedException` until a reopen; reads go on. Callers must not interrupt
   threads that write. The fix is to do the log's I/O on a thread of its own, which group commit (day 4) needs anyway.
+- **An interrupted reader doesn't break a table** (day 2). A table's channel is interruptible too, and a probe
+  showed that one interrupted `get` closed it for every thread: each later read of that table failed with
+  `ClosedChannelException` until a reopen. Now a read that finds the channel closed while the table still has
+  references reopens it (once, under a lock, so concurrent readers don't each open one) and retries; the
+  interrupted read itself still fails, with the interrupt status set. A table whose last reference is gone is never
+  reopened. (`TableTest.anInterruptedReadDoesNotBreakTheTableForOthers`.)
 - **Close** forces the log (whatever the sync policy), closes it and releases the lock, so when it returns every
   acknowledged write is on the device. `put`, `delete` and `get` after `close` fail with `IllegalStateException`;
   the accessors (`lastSequence()` and the rest) still answer. `close` waits for a write in progress, since it takes

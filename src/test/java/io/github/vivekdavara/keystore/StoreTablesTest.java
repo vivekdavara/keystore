@@ -197,6 +197,24 @@ class StoreTablesTest {
         assertEquals(tables, files(".sst"), "nothing was deleted");
     }
 
+    /** A table the manifest names but that is gone (deleted by hand, say) refuses the open; nothing is deleted. */
+    @Test
+    void aMissingLiveTableRefusesTheOpen() throws IOException {
+        try (Store store = Store.open(dir, SMALL)) {
+            store.put(utf8("a"), utf8("1"));
+            store.flush();
+            store.put(utf8("b"), utf8("2"));
+            store.flush();
+        }
+        List<String> tables = files(".sst");
+        assertEquals(2, tables.size());
+        Files.delete(dir.resolve(tables.get(0)));
+        List<String> logs = files(".log");
+        assertThrows(java.nio.file.NoSuchFileException.class, () -> Store.open(dir, SMALL));
+        assertEquals(tables.subList(1, 2), files(".sst"), "the other table is still there");
+        assertEquals(logs, files(".log"));
+    }
+
     /** A day-1 directory (one wal.log, no manifest) is refused too, not taken for a new store. */
     @Test
     void aDayOneDirectoryIsRefused() throws IOException {

@@ -67,13 +67,17 @@ class DurabilityTest {
     void everyOpenForcesTheLogsDirectory() throws IOException {
         Files.createDirectories(dir.resolve("s"));
         Path real = dir.resolve("s").toRealPath();
-        Files.createFile(real.resolve(Store.LOG_FILE)); // as a crash right after creating it leaves it
+        try (Store created = Store.open(real, Options.defaults(), counting)) {
+            assertEquals(2, forcesOf(real), "the manifest's rename, then the new log");
+            assertEquals(0, created.lastSequence());
+        }
+        // Now an empty log and a manifest, as a crash right after creating the log leaves them.
         try (Store opened = Store.open(real, Options.defaults(), counting)) {
-            assertEquals(1, forcesOf(real));
+            assertEquals(3, forcesOf(real), "the existing log's directory, again");
             assertEquals(0, opened.lastSequence());
         }
         try (Store opened = Store.open(real, Options.defaults(), counting)) {
-            assertEquals(2, forcesOf(real));
+            assertEquals(4, forcesOf(real));
             assertEquals(0, opened.lastSequence());
         }
     }
@@ -85,7 +89,7 @@ class DurabilityTest {
             store.put(utf8("a"), utf8("1"));
             store.put(utf8("b"), utf8("2"));
         }
-        Path log = dir.resolve(Store.LOG_FILE).toRealPath();
+        Path log = dir.resolve(Store.logName(1)).toRealPath();
         try (RandomAccessFile raw = new RandomAccessFile(log.toFile(), "rw")) {
             raw.setLength(Files.size(log) - 1);
         }
@@ -109,7 +113,7 @@ class DurabilityTest {
                 store.put(utf8("k" + i), utf8("v"));
             }
         }
-        Path log = dir.resolve(Store.LOG_FILE);
+        Path log = dir.resolve(Store.logName(1));
         byte[] bytes = Files.readAllBytes(log);
         bytes[10] ^= 1; // damage record #1, so the default refuses
         Files.write(log, bytes);

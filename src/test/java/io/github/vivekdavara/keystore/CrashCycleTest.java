@@ -46,7 +46,7 @@ class CrashCycleTest {
 
         for (int cycle = 0; cycle < 200; cycle++) {
             try (Store store = Store.open(dir, options, (path, inner) -> {
-                if (!path.endsWith(Store.LOG_FILE)) {
+                if (!path.endsWith(Store.logName(1))) {
                     return inner;
                 }
                 FaultyChannel faulty = new FaultyChannel(inner);
@@ -100,7 +100,7 @@ class CrashCycleTest {
     }
 
     private void appendToLog(byte[] bytes) throws IOException {
-        try (FileChannel log = FileChannel.open(dir.resolve(Store.LOG_FILE), StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
+        try (FileChannel log = FileChannel.open(dir.resolve(Store.logName(1)), StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
             log.write(ByteBuffer.wrap(bytes));
         }
     }

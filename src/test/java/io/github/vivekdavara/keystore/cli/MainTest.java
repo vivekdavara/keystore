@@ -2,6 +2,7 @@ package io.github.vivekdavara.keystore.cli;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.vivekdavara.keystore.Store;
@@ -50,7 +51,7 @@ class MainTest {
         assertEquals("keystore: no store at " + elsewhere + "\n", err);
         assertTrue(Files.notExists(elsewhere));
         assertEquals(1, run("get", dir.toString(), "k")); // a directory, but not a store
-        assertTrue(Files.notExists(dir.resolve("wal.log")));
+        assertTrue(Files.notExists(dir.resolve("000001.log")));
         assertTrue(Files.notExists(dir.resolve("LOCK")));
     }
 
@@ -73,7 +74,9 @@ class MainTest {
             assertEquals(0, store.lastSequence());
         }
         assertEquals(1, run("dump", dir.resolve("nowhere").toString()));
-        assertTrue(err.startsWith("keystore: no log at"), err);
+        assertTrue(err.startsWith("keystore: no store at"), err);
+        assertEquals(1, run("flush", dir.resolve("nowhere").toString()));
+        assertFalse(Files.exists(dir.resolve("nowhere")), "only a write creates a store");
     }
 
     @Test
@@ -92,7 +95,7 @@ class MainTest {
         String d = dir.toString();
         run("put", d, "a", "1");
         run("put", d, "b", "2");
-        Path log = dir.resolve("wal.log");
+        Path log = dir.resolve("000001.log");
         try (RandomAccessFile raw = new RandomAccessFile(log.toFile(), "rw")) {
             raw.setLength(Files.size(log) - 2);
         }
@@ -110,7 +113,7 @@ class MainTest {
         for (int i = 1; i <= 4; i++) {
             run("put", d, "k" + i, "v" + i);
         }
-        Path log = dir.resolve("wal.log");
+        Path log = dir.resolve("000001.log");
         byte[] bytes = Files.readAllBytes(log);
         int recordSize = bytes.length / 4;
         bytes[recordSize + 12] ^= 1; // the seq of record #2

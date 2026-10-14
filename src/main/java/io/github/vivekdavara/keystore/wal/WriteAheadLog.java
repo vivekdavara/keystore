@@ -52,6 +52,17 @@ public final class WriteAheadLog implements Closeable {
     public static Opened open(
             Path file, RecoveryMode mode, Consumer<WalRecord> apply, long maxBytes,
             BiFunction<Path, FileChannel, FileChannel> wrap) throws IOException {
+        return open(file, 1, mode, apply, maxBytes, wrap);
+    }
+
+    /**
+     * {@link #open(Path, RecoveryMode, Consumer, long, BiFunction)} for a log whose first record
+     * must have sequence number {@code firstSeq}: the one after the last write the store's tables
+     * or older logs hold.
+     */
+    public static Opened open(
+            Path file, long firstSeq, RecoveryMode mode, Consumer<WalRecord> apply, long maxBytes,
+            BiFunction<Path, FileChannel, FileChannel> wrap) throws IOException {
         if (maxBytes < 1 || maxBytes > MAX_RECOVERABLE_BYTES) {
             throw new IllegalArgumentException("the log's limit must be 1 to " + MAX_RECOVERABLE_BYTES + ", not " + maxBytes);
         }
@@ -67,7 +78,7 @@ public final class WriteAheadLog implements Closeable {
                         + MAX_RECOVERABLE_BYTES);
             }
             byte[] bytes = readFully(channel, (int) length);
-            Recovery recovery = WalReader.read(bytes, bytes.length, 1, mode, apply);
+            Recovery recovery = WalReader.read(bytes, bytes.length, firstSeq, mode, apply);
             if (recovery.validBytes() < length) {
                 channel.truncate(recovery.validBytes());
                 // Forced before anything is appended: otherwise a crash after new appends could leave
@@ -87,6 +98,33 @@ public final class WriteAheadLog implements Closeable {
     }
 
     /**
+     * Replays an older log, one the store closed when it started a newer one (and forced first),
+     * so it must be clean: only the newest log can end in a torn write. Leaves the file as it is.
+     *
+     * @throws WalCorruptionException if the log isn't clean, in any recovery mode: dropping its
+     *     tail would lose the writes in the newer logs after it
+     */
+    public static Recovery replayClosed(
+            Path file, long firstSeq, Consumer<WalRecord> apply, BiFunction<Path, FileChannel, FileChannel> wrap)
+            throws IOException {
+        try (FileChannel channel = wrap.apply(file, FileChannel.open(file, StandardOpenOption.READ))) {
+            long length = channel.size();
+            if (length > MAX_RECOVERABLE_BYTES) {
+                throw new IOException(file + " is " + length + " bytes; recovery reads a log whole, up to "
+                        + MAX_RECOVERABLE_BYTES);
+            }
+            byte[] bytes = readFully(channel, (int) length);
+            Recovery recovery = WalReader.read(bytes, bytes.length, firstSeq, RecoveryMode.TOLERATE_TORN_TAIL, apply);
+            if (recovery.outcome() != Recovery.Outcome.CLEAN) {
+                throw new WalCorruptionException(file + " is an older log, closed and forced before a newer one"
+                        + " started, but " + recovery.detail() + "; writes in the newer logs follow it, so it"
+                        + " can't be a torn write", recovery.validBytes());
+            }
+            return recovery;
+        }
+    }
+
+    /**
      * Throws {@link LogFullException} if appending the record would take the log past its limit.
      * Nothing is written either way, so the log is as it was.
      */
@@ -94,7 +132,7 @@ public final class WriteAheadLog implements Closeable {
         long after = size + WalFormat.encodedSize(record);
         if (after > maxBytes) {
             throw new LogFullException("the log is " + size + " bytes; this write would take it to " + after
-                    + ", past its limit of " + maxBytes + " (day 1 has no log rotation)");
+                    + ", past its limit of " + maxBytes);
         }
     }
 

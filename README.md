@@ -57,6 +57,10 @@ scripts/keystore put target/demo city Boston
 ```
 
 ```bash
+scripts/keystore flush target/demo
+```
+
+```bash
 scripts/keystore get target/demo city
 ```
 
@@ -68,13 +72,15 @@ scripts/keystore delete target/demo city
 scripts/keystore dump target/demo
 ```
 
-`get` prints `Boston`. `dump` reads the log without changing it; after those three commands it prints:
+`get` prints `Boston`, read from the table the flush wrote. `dump` reads the manifest and the logs without changing
+anything; after those four commands it prints:
 
 ```
-target/demo/wal.log: 60 bytes
-         0  #1 put city (6 bytes)
-        35  #2 delete city
-clean: 60 bytes, every one a good record
+target/demo/MANIFEST: tables cover writes up to #1; logs start at 000002.log; next file number 4
+  000003.sst: 152 bytes, writes #1 to #1
+target/demo/000002.log: 25 bytes
+         0  #2 delete city
+clean: 25 bytes, every one a good record
 ```
 
 For a log the store would refuse to open, it shows where the damage is and lists the intact records after it, the

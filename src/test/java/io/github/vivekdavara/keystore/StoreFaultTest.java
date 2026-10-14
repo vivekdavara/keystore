@@ -37,7 +37,7 @@ class StoreFaultTest {
     /** Opens the store with its log's channel (only that one) wrapped in a {@link FaultyChannel}. */
     private Store openFaulty(Options options) throws IOException {
         return Store.open(dir, options, (path, inner) -> {
-            if (!path.endsWith(Store.LOG_FILE)) {
+            if (!path.endsWith(Store.logName(1))) {
                 return inner;
             }
             FaultyChannel faulty = new FaultyChannel(inner);
@@ -137,7 +137,7 @@ class StoreFaultTest {
         }
         try (Store store = Store.open(dir)) {
             assertEquals(1, store.lastSequence());
-            assertTrue(Files.size(dir.resolve(Store.LOG_FILE)) > 0);
+            assertTrue(Files.size(dir.resolve(Store.logName(1))) > 0);
         }
     }
 

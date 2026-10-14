@@ -31,7 +31,7 @@ class ReadmeTest {
         while (command.find()) {
             commands.add(command.group(1).split(" "));
         }
-        assertEquals(4, commands.size(), "put, get, delete and dump");
+        assertEquals(5, commands.size(), "put, flush, get, delete and dump");
 
         Matcher shown = Pattern.compile("it prints:\n\n```\n(.*?)```", Pattern.DOTALL).matcher(section);
         assertTrue(shown.find(), "the README shows the dump's output");

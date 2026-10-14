@@ -164,7 +164,7 @@ class StoreTest {
             store.put(utf8("a"), utf8("1"));
             store.put(utf8("b"), utf8("2"));
         }
-        Path log = dir.resolve(Store.LOG_FILE);
+        Path log = dir.resolve(Store.logName(1));
         try (RandomAccessFile raw = new RandomAccessFile(log.toFile(), "rw")) {
             raw.setLength(Files.size(log) - 1); // the crash came one byte short of finishing #2
         }
@@ -189,7 +189,7 @@ class StoreTest {
                 store.put(utf8("k" + i), utf8("v" + i));
             }
         }
-        Path log = dir.resolve(Store.LOG_FILE);
+        Path log = dir.resolve(Store.logName(1));
         byte[] bytes = Files.readAllBytes(log);
         int third = 2 * (bytes.length / 5); // the records are the same size
         bytes[third + 20] ^= 0x40;
@@ -245,7 +245,7 @@ class StoreTest {
             store.put(utf8("k"), utf8("v"));
             assertEquals(nested.toRealPath(), store.directory());
         }
-        assertTrue(Files.exists(nested.resolve(Store.LOG_FILE)));
+        assertTrue(Files.exists(nested.resolve(Store.logName(1))));
         assertTrue(Files.exists(nested.resolve(Store.LOCK_FILE)));
     }
 

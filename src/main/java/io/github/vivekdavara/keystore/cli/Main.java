@@ -2,6 +2,7 @@ package io.github.vivekdavara.keystore.cli;
 
 import io.github.vivekdavara.keystore.Bytes;
 import io.github.vivekdavara.keystore.Store;
+import io.github.vivekdavara.keystore.StoreDump;
 import io.github.vivekdavara.keystore.wal.WalDump;
 import java.io.IOException;
 import java.io.PrintStream;
@@ -16,7 +17,10 @@ import java.util.Optional;
  * keystore put DIR KEY VALUE    set KEY to VALUE (UTF-8)
  * keystore get DIR KEY          print KEY's value; exit 1 if there is none (or no store)
  * keystore delete DIR KEY       delete KEY
- * keystore dump DIR             list the log's records and what recovery would do; changes nothing
+ * keystore flush DIR            flush the memtable to a table now
+ * keystore compact DIR          merge every table into one
+ * keystore dump DIR             list the tables, the logs' records, and what recovery would do;
+ *                               changes nothing
  * </pre>
  *
  * Exit status: 0 done, 1 not found or an error, 2 usage, 3 the log is damaged so that a store
@@ -29,6 +33,8 @@ public final class Main {
             "usage: keystore put DIR KEY VALUE",
             "       keystore get DIR KEY",
             "       keystore delete DIR KEY",
+            "       keystore flush DIR",
+            "       keystore compact DIR",
             "       keystore dump DIR");
 
     public static void main(String[] args) {
@@ -40,7 +46,7 @@ public final class Main {
         int arity = switch (command) {
             case "put" -> 4;
             case "get", "delete" -> 3;
-            case "dump" -> 2;
+            case "flush", "compact", "dump" -> 2;
             default -> -1;
         };
         if (arity < 0 || args.length != arity) {
@@ -48,26 +54,24 @@ public final class Main {
             return 2;
         }
         Path dir = Path.of(args[1]);
-        Path log = dir.resolve("wal.log");
         try {
-            if (command.equals("dump")) {
-                if (!Files.exists(log)) {
-                    err.println("keystore: no log at " + log);
-                    return 1;
-                }
-                return WalDump.dump(log, out) == WalDump.Verdict.REFUSED ? 3 : 0;
-            }
-            if (command.equals("get") && !Files.exists(log)) {
-                // Opening would create a store there; a read shouldn't create anything.
+            boolean exists = Files.exists(dir.resolve("MANIFEST"));
+            if (!exists && !command.equals("put") && !command.equals("delete")) {
+                // Opening would create a store there; only a write should create one.
                 err.println("keystore: no store at " + dir);
                 return 1;
             }
+            if (command.equals("dump")) {
+                return StoreDump.dump(dir, out) == WalDump.Verdict.REFUSED ? 3 : 0;
+            }
             try (Store store = Store.open(dir)) {
-                byte[] key = Bytes.utf8(args[2]);
                 switch (command) {
-                    case "put" -> store.put(key, Bytes.utf8(args[3]));
-                    case "delete" -> store.delete(key);
+                    case "put" -> store.put(Bytes.utf8(args[2]), Bytes.utf8(args[3]));
+                    case "delete" -> store.delete(Bytes.utf8(args[2]));
+                    case "flush" -> store.flush();
+                    case "compact" -> store.compactAll();
                     default -> {
+                        byte[] key = Bytes.utf8(args[2]);
                         Optional<byte[]> value = store.get(key);
                         if (value.isEmpty()) {
                             err.println("keystore: " + args[2] + ": not found");

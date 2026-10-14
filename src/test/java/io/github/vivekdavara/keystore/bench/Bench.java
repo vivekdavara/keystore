@@ -88,7 +88,7 @@ public final class Bench {
                     store.put(key(i), value);
                 }
             }
-            long logBytes = Files.size(dir.resolve("wal.log"));
+            long logBytes = Files.size(dir.resolve("000001.log"));
             for (int run = 0; run < 2; run++) {
                 long start = System.nanoTime();
                 try (Store store = Store.open(dir)) {

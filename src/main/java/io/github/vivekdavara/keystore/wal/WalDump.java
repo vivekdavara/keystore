@@ -24,15 +24,24 @@ public final class WalDump {
         REFUSED
     }
 
-    public static Verdict dump(Path file, PrintStream out) throws IOException {
+    /** What the dump found: the verdict, and the last good record's sequence number. */
+    public record Result(Verdict verdict, long lastSeq) {}
+
+    /**
+     * Prints the log at {@code file}, whose first record should be number {@code firstSeq}, and
+     * what recovery would do with it.
+     */
+    public static Result dump(Path file, long firstSeq, PrintStream out) throws IOException {
         byte[] log = Files.readAllBytes(file);
         out.printf("%s: %d bytes%n", file, log.length);
         Verdict verdict;
         long kept;
+        long lastSeq = firstSeq - 1;
         String refusal = "";
         try {
-            Recovery recovery = WalReader.read(log, log.length, 1, RecoveryMode.TOLERATE_TORN_TAIL, r -> {});
+            Recovery recovery = WalReader.read(log, log.length, firstSeq, RecoveryMode.TOLERATE_TORN_TAIL, r -> {});
             kept = recovery.validBytes();
+            lastSeq = recovery.lastSeq();
             verdict = recovery.outcome() == Recovery.Outcome.CLEAN ? Verdict.CLEAN : Verdict.TORN_TAIL;
         } catch (WalCorruptionException e) {
             kept = e.offset();
@@ -45,6 +54,7 @@ public final class WalDump {
             Ok ok = (Ok) WalFormat.decode(log, offset, log.length);
             out.printf("%10d  %s%n", offset, describe(ok.record()));
             offset = ok.next();
+            lastSeq = ok.record().seq();
         }
         switch (verdict) {
             case CLEAN -> out.printf("clean: %d bytes, every one a good record%n", log.length);
@@ -61,7 +71,7 @@ public final class WalDump {
                         kept, log.length - kept, dropped);
             }
         }
-        return verdict;
+        return new Result(verdict, lastSeq);
     }
 
     /** Prints the intact records after {@code from}, scanning past damage; returns how many. */

@@ -283,19 +283,20 @@ public final class Store implements Closeable {
         Recovery recovery = new Recovery(last.outcome(), records + last.records(), last.lastSeq(),
                 last.validBytes(), last.droppedBytes(), last.detail());
 
-        // Recovery succeeded: remove what the manifest doesn't account for. Best effort: anything
-        // left is removed by the next open.
+        // Recovery succeeded: remove what the manifest doesn't account for. Best effort: a file that
+        // can't be deleted now is removed by the next open, and failing here would fail an open
+        // whose recovery is done (and leave the newest log's channel open).
         for (long number : logs) {
             if (number < manifest.logNumber()) {
-                Files.deleteIfExists(real.resolve(logName(number)));
+                deleteQuietly(real.resolve(logName(number)));
             }
         }
         for (long number : tableFiles) {
             if (!live.contains(number)) {
-                Files.deleteIfExists(real.resolve(tableName(number)));
+                deleteQuietly(real.resolve(tableName(number)));
             }
         }
-        Files.deleteIfExists(real.resolve(Manifest.TEMP_FILE));
+        deleteQuietly(real.resolve(Manifest.TEMP_FILE));
 
         Version version = new Version(memtable, null, tables);
         for (Table table : tables) {
@@ -540,6 +541,14 @@ public final class Store implements Closeable {
         Manifest next = new Manifest(nextFileNumber, logNumber, lastSequence, refs);
         next.write(dir, wrap);
         manifest = next;
+    }
+
+    private static void deleteQuietly(Path file) {
+        try {
+            Files.deleteIfExists(file);
+        } catch (IOException ignored) {
+            // Garbage the next open removes.
+        }
     }
 
     private void deleteLogsBefore(long number) {

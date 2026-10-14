@@ -5,14 +5,18 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 import io.github.vivekdavara.keystore.sstable.CorruptTableException;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -213,6 +217,34 @@ class StoreTablesTest {
         assertThrows(java.nio.file.NoSuchFileException.class, () -> Store.open(dir, SMALL));
         assertEquals(tables.subList(1, 2), files(".sst"), "the other table is still there");
         assertEquals(logs, files(".log"));
+    }
+
+    /**
+     * Deleting garbage after recovery is best effort: a file that can't be deleted (here, in a
+     * directory made read-only) doesn't fail an open whose recovery is done.
+     */
+    @Test
+    void garbageThatCannotBeDeletedDoesNotFailTheOpen() throws IOException {
+        try (Store store = Store.open(dir, SMALL)) {
+            store.put(utf8("a"), utf8("1"));
+            store.flush();
+        }
+        Files.write(dir.resolve("000099.sst"), new byte[] {1}); // an unfinished flush's table, say
+        Set<PosixFilePermission> before = Files.getPosixFilePermissions(dir);
+        Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-x------"));
+        try {
+            assumeFalse(Files.isWritable(dir), "permissions don't bind this user (root?)");
+            try (Store store = Store.open(dir, SMALL)) {
+                assertEquals(Optional.of("1"), string(store.get(utf8("a"))));
+            }
+            assertTrue(Files.exists(dir.resolve("000099.sst")), "left for the next open");
+        } finally {
+            Files.setPosixFilePermissions(dir, before);
+        }
+        try (Store store = Store.open(dir, SMALL)) {
+            assertEquals(Optional.of("1"), string(store.get(utf8("a"))));
+        }
+        assertFalse(Files.exists(dir.resolve("000099.sst")), "removed once it could be");
     }
 
     /** A day-1 directory (one wal.log, no manifest) is refused too, not taken for a new store. */

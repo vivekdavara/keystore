@@ -491,8 +491,12 @@ is intact but in the wrong place (old bytes left beyond a truncation, say); the 
   manifest. The directory's state is uncertain (a manifest rename may or may not have reached the device), and a
   reopen recovers from whatever did. Reads go on: the version still has the frozen memtable, or the merge's inputs.
   A table the manifest might name is never deleted on such a failure, only closed; if the manifest on the device
-  doesn't name it, the next open deletes it. `StoreTablesTest` fails the manifest's write during a flush and loses
-  nothing.
+  doesn't name it, the next open deletes it, and a merge marks its inputs obsolete only once the manifest without
+  them is written. `StoreTablesTest` fails the manifest's write during a flush and loses nothing;
+  `FlushMergeFaultCloseTest` (from the review) fails every single write and force of a flush or a merge in turn,
+  under both sync policies, then closes, reopens and checks the acknowledged writes and what close said. One case a
+  review found: when the flush has forced and closed the old log and then fails to start the new one, close has
+  nothing to force, and must not report under `NEVER` that acknowledged writes may be lost (it did).
 - **The outcome of a failed write is unknown.** The caller got an exception, but the record may have reached the
   device; if it did, recovery replays it. This is the same as any timeout in a distributed system, and it's why
   replication (day 3) identifies writes by sequence number.
@@ -610,7 +614,10 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
   manifest (the crash test and the failed-manifest test fail), the table's force and the directory force before the
   manifest (`DurabilityTest`), the offset in the block checksum (the swap test), the index count check (the test JVM
   runs out of heap), pinning the version for a read (`AsynchronousCloseException` in readers), the frozen memtable in
-  the version (a published key goes missing).
+  the version (a published key goes missing), the tombstone rule (a deleted key's old value comes back), the
+  best-effort garbage deletion, the table channel's reopen after an interrupt; and, from the review's sweep, a
+  merge marking inputs obsolete before the manifest, `compactAll` not failing the store, `flush` and `compactAll`
+  running after a failure, a failed flush taken for a failed per-write force, and the rotation's clean close.
 - **What the tests can't show.** As on day 1, the forces are counted, not power-cut. The crash test's images keep
   the page cache, as a killed process does; a power loss can also lose writes that weren't forced, and the order of
   forces is what protects against that, which only the counts check.

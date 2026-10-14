@@ -132,6 +132,7 @@ try (Store store = Store.open(Path.of("target/demo"))) {
 | Which adjacent tables a merge takes | `CompactionTest` |
 | 360 crash-and-recover cycles with faults anywhere (appends, tables, the manifest, directory forces), 249 crashes, against the acknowledged writes | `TableCrashCycleTest` |
 | A flush and a merge force each file they must, in order | `DurabilityTest` |
+| A fault at every single write and force of a flush, a merge and a write that flushes, both sync policies, then close and reopen: nothing acknowledged lost, close's answer right (from the review) | `FlushMergeFaultCloseTest` |
 | Four readers alongside constant flushes and merges never miss a key or read a stale value; no file is left open or behind | `StoreConcurrencyTest` |
 
 Most of the mechanisms these tests cover were also checked the other way round: removed in a copy of the file, a
@@ -231,8 +232,21 @@ the interrupt closed the table's channel, and every later read of that table fai
 until a reopen (a probe showed it). A table now reopens its channel when a read finds it closed while the table is
 still live; the interrupted read still fails.
 
-The second agent left nothing, so it was run again after the limit reset, on failure handling during flushes and
-merges (below, if it found anything).
+The second agent left nothing, so it was run again after the limit reset (on `4933ba4`, about 26 minutes), on
+failure handling during flushes and merges. It injected a fault at every single write and force of a flush, a
+merge and a write that flushes, under both sync policies, then closed, reopened and compared with the acknowledged
+writes. Nothing acknowledged was lost and the manifest never named a missing table, but it found:
+
+- **`close()` threw `StoreFailedException` under `NEVER` for nothing**: after a flush had forced and closed the
+  old log and then failed to start the new one, close took the closed log for one it couldn't force. Fixed; the
+  store notes that the rotation closed the log cleanly.
+- **An undeletable garbage file failed the reopen**, and leaked the newest log's channel. I had found and fixed the
+  same thing an hour earlier (`00ed282`), independently.
+- **Five mechanisms no test noticed when broken**, which its sweep test (`FlushMergeFaultCloseTest`, now in the
+  repo) catches: a merge marking its inputs obsolete before the manifest is written (a failed manifest write would
+  then delete files the manifest on disk still names), `compactAll` not failing the store, `flush` and `compactAll`
+  running after a failure, and a failed flush taken for a failed per-write force (close then skips a force it needs
+  under `NEVER`).
 
 ## Design decisions
 

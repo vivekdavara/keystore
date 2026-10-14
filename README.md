@@ -140,16 +140,67 @@ test had to fail, and the file was restored. DESIGN.md, "Testing", lists which.
 
 ## Results
 
-Measured on an Apple M3 (macOS 26.6, the internal SSD, APFS) with Homebrew OpenJDK 21.0.12, on power, with nothing
-else running: `scripts/bench.sh 5` at `1ace995`, which prints one line per run. Each figure is the median of 5
-runs, each run after a warm-up run in the same JVM. These are plain wall-clock timings, not JMH (that's day 4).
+These are plain wall-clock timings, not JMH (that's day 4): `scripts/bench.sh` prints one line per run, each run
+after a warm-up run in the same JVM, and each figure below is the median of 5 runs. `Bench` is
+`java -cp target/classes:target/test-classes io.github.vivekdavara.keystore.bench.Bench`.
 
-| What | Median of 5 | Command (`Bench` is `java -cp target/classes:target/test-classes io.github.vivekdavara.keystore.bench.Bench`) |
+### Day 2: flushes, merges, and reads from tables
+
+Measured on an Apple M3 (macOS 26.6.2, the internal SSD, APFS) with Homebrew OpenJDK 21.0.12, **on battery** (Low
+Power Mode off), with nothing else running: `scripts/bench.sh 5 2` and five runs of `Bench recover 1000000 100`, at
+`bcd744b`, 17:52 to 17:55. Keys are 16 bytes and values 100; the data is synthetic.
+
+| What | Median of 5 (range) | Command |
+|---|---|---|
+| 1,000,000 puts in random key order under `NEVER`, with the default flush (every 4 MiB of log) and merges (tiers of 4) | 253,593 writes/s (223,601 to 256,178); p50 2.0 µs, p99 4.5 µs, p99.9 8.3 µs; slowest 254 ms (249 to 386) | `Bench fill 1000000 100` |
+| What those puts did | 33 flushes and 10 merges, 3 tables left; 3.37 bytes of table written per byte of keys and values: 1.15 by flushes, 2.22 by merges (the same in every run) | same |
+| Reopening that store | 9 ms | same |
+| `get` of a present key, 1,000,000 keys flushed into 4 tables, 10 bits a key | p50 2.0 µs, p99 3.8 µs; 1.020 data blocks read a get | `Bench reads 1000000 100 10` |
+| `get` of an absent key (between two present ones), the same store | p50 0.1 µs, p99 2.3 µs; 0.033 data blocks a get | same |
+| 200,000 puts under `NEVER` (day 1's measurement, which now includes 6 flushes and a merge) | 336,578 writes/s (211,400 to 339,257); p50 1.7 µs, p99 3.8 µs; slowest 85 ms | `Bench writes NEVER 200000 100` |
+| Recovery: open a store whose one log holds 1,000,000 puts (141.0 MB; the flush disabled, as on day 1) | 250 ms (246 to 296): 4.0 million records/s, 564 MB/s | `Bench recover 1000000 100` |
+
+The Bloom filter's size against the cost of a `get` (`Bench reads 1000000 100 BITS`, the same store each time):
+
+| Bits a key | Probes | Absent key: blocks a get | Absent key: p50, p99 | Present key: blocks a get | Present key: p50, p99 | 4 × the formula's false-positive rate |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 2.526 | 4.7 µs, 8.1 µs | 2.519 | 4.5 µs, 8.0 µs | 2.53 |
+| 5 | 3 | 0.365 | 0.1 µs, 4.1 µs | 1.222 | 2.1 µs, 6.3 µs | 0.37 |
+| 10 (default) | 7 | 0.033 | 0.1 µs, 2.3 µs | 1.020 | 2.0 µs, 3.8 µs | 0.033 |
+| 16 | 11 | 0.002 | 0.1 µs, 0.2 µs | 1.001 | 2.0 µs, 2.8 µs | 0.002 |
+
+What the numbers say:
+
+- **The Bloom filter does what the formula says.** The keys were put in random order, so every table's key range
+  covers almost every key, and an absent key's cost is set by the filters alone: four tables times the false-positive
+  rate `(1 - e^(-k/b))^k` predicts the blocks read to the third decimal at every size. At 10 bits a key, a miss
+  costs a twentieth of a block; at 1 bit (a filter that says "maybe" 63% of the time) it costs two and a half
+  blocks and 4.7 µs instead of 0.1 µs.
+- **A hit costs one block read**, a positional read of 4 KiB through the page cache (warm here: this is CPU and
+  system-call time, not the SSD) plus a checksum and a scan: about 2 µs. The 0.02 extra blocks are false positives in
+  the tables checked before the one that has the key.
+- **Writes are as fast as on day 1 between flushes** (p50 1.7 to 2.0 µs), but the write that triggers a flush and
+  a merge waits for both: 254 ms for the slowest of a million, 85 ms of 200,000. That is the cost of doing them in
+  the writer's thread (DESIGN.md, "Limitations"). The 200,000-put throughput fell from day 1's 525,217 writes/s to
+  336,578 with the median write unchanged at 1.7 µs, so the difference is in the writes that waited (day 1 was
+  measured on power, this on battery).
+- **Size-tiered compaction wrote 3.37 bytes of table for each byte of data** for a million random keys, on top of
+  the log. With merges of four, 33 flushes and 10 merges means 8 merges of flushed tables and 2 of their outputs, so
+  most keys were rewritten twice by merges, which is the 2.22.
+- **Reopening a store with tables is cheap**: 9 ms, since only footers, filters and indexes are read and the newest
+  log holds at most about 4 MiB.
+
+### Day 1: the log and the memtable
+
+Measured on an Apple M3 (macOS 26.6, the internal SSD, APFS) with Homebrew OpenJDK 21.0.12, on power, with nothing
+else running: `scripts/bench.sh 5` at `1ace995`.
+
+| What | Median of 5 | Command |
 |---|---|---|
 | A 128-byte append, then `fsync`, in C | p50 26 µs, p99 64 µs | `target/fsync_cost target 1000` |
 | A 128-byte append, then `fcntl(F_FULLFSYNC)`, in C | p50 2,994 µs, p99 3,591 µs | same |
 | `put` under `EVERY_WRITE` (16-byte key, 100-byte value) | 361 writes/s; p50 2,990 µs, p99 3,977 µs | `Bench writes EVERY_WRITE 1000 100` |
-| `put` under `NEVER` | 525,217 writes/s; p50 1.7 µs, p99 4.2 µs | `Bench writes NEVER 200000 100` |
+| `put` under `NEVER` (no flushes yet on day 1; see above for day 2) | 525,217 writes/s; p50 1.7 µs, p99 4.2 µs | `Bench writes NEVER 200000 100` |
 | Recovery: open a store whose log holds 1,000,000 puts (141.0 MB) | 284 ms: 3.5 million records/s, 496 MB/s | `Bench recover 1000000 100` |
 | The scan after damage, over a 64 MiB tail of zeros | 60 ms (1,113 MB/s) | `Bench scan 67108864 zeros` |
 | The same over a 64 MiB tail of random bytes | 75 ms (895 MB/s) | `Bench scan 67108864 random` |
@@ -241,7 +292,7 @@ writes. Nothing acknowledged was lost and the manifest never named a missing tab
   old log and then failed to start the new one, close took the closed log for one it couldn't force. Fixed; the
   store notes that the rotation closed the log cleanly.
 - **An undeletable garbage file failed the reopen**, and leaked the newest log's channel. I had found and fixed the
-  same thing an hour earlier (`00ed282`), independently.
+  same thing independently while the review was running (`00ed282`, at 17:38).
 - **Five mechanisms no test noticed when broken**, which its sweep test (`FlushMergeFaultCloseTest`, now in the
   repo) catches: a merge marking its inputs obsolete before the manifest is written (a failed manifest write would
   then delete files the manifest on disk still names), `compactAll` not failing the store, `flush` and `compactAll`

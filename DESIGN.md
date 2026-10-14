@@ -393,7 +393,7 @@ both are dropped. (A merge that drops everything writes no table at all.)
 
 **Write amplification.** `bench fill` puts a million 116-byte writes in random key order: flushes write 1.15 bytes
 of table per byte of keys and values (the table holds the keys and values plus framing, the filter and the index),
-and merges another 2.22, 3.37 in all, on top of the log itself (README, "Results").
+and merges another 2.22, 3.37 in all, on top of the log itself, the same in every run (README, "Results").
 
 ## Recovery
 
@@ -636,7 +636,7 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
 ## Limitations
 
 - **Flushes and merges run in the writer's thread, under the write lock**, so the write that triggers them waits:
-  the slowest write in `bench fill` (a million writes) waited 316 ms. Reads go on meanwhile. LevelDB and RocksDB do
+  the slowest of a million writes in `bench fill` waited 254 ms (median of 5 runs; 249 to 386). Reads go on meanwhile. LevelDB and RocksDB do
   both on background threads and slow writes down only when they fall behind; that, with group commit, is day 4's.
 - **A merge takes a whole tier at once**, so it needs room for its output beside its inputs, as big as the tier;
   and the biggest tier's merge rewrites most of the data.

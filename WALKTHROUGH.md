@@ -220,7 +220,8 @@ frozen memtable if a flush is running, and each table newest first, stopping at 
 table, `Table.get` first checks the key against the table's smallest and largest keys and its Bloom filter, which
 costs no I/O; then it binary-searches the in-memory index for the first block whose last key is at least the key,
 reads that one block with a positional read, checks its checksum, and scans it. Measured with a million keys in four
-tables: a present key p50 2.2 µs, reading 1.02 blocks; an absent key p50 0.1 µs, 0.033 blocks (README, "Results").
+tables (medians of 5): a present key p50 2.0 µs, reading 1.02 blocks; an absent key p50 0.1 µs, 0.033 blocks
+(README, "Results").
 
 **Why is newest-first the right order?**
 Each place holds only writes newer than every place after it: the memtable's are newer than the frozen memtable's,
@@ -239,7 +240,9 @@ Each key sets 7 bits of a bit array, picked by double hashing one 64-bit MurmurH
 checks the same 7 bits, and any zero means "definitely not here". With b bits a key and k probes the false-positive
 rate is about `(1 - e^(-k/b))^k`, minimised at `k = b ln 2`: 10 bits gives 0.82% in theory and 0.90% measured
 (`BloomFilterTest`). It costs 1.25 bytes a key of memory, and it is what makes a miss cheap: without it, a key a
-table doesn't have would still cost a block read in every table whose range covers it.
+table doesn't have would still cost a block read in every table whose range covers it. Measured over four tables, a
+miss reads 2.526 blocks at 1 bit a key, 0.365 at 5, 0.033 at 10 and 0.002 at 16, which is four times the formula's
+rate each time.
 
 **Why does the block checksum include the block's offset?**
 A review found that bytes alone weren't enough: two blocks of one length, swapped, both passed their checksums, and
@@ -305,7 +308,7 @@ interrupted `get` closed a table's channel for every reader.
 
 **What happens to writes while a flush or merge runs?**
 They wait: both run in the writing thread under the write lock. Reads don't wait. The slowest of a million writes in
-`bench fill` waited 316 ms for a merge. LevelDB and RocksDB do this work on background threads and only slow writers
+`bench fill` waited 254 ms (median of 5 runs) for a flush and a merge. LevelDB and RocksDB do this work on background threads and only slow writers
 down when it falls behind; that's day 4's, with group commit.
 
 ## What's next

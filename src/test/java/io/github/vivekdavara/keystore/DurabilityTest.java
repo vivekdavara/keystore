@@ -13,6 +13,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.BiFunction;
 import java.util.stream.Stream;
@@ -79,6 +80,50 @@ class DurabilityTest {
         try (Store opened = Store.open(real, Options.defaults(), counting)) {
             assertEquals(4, forcesOf(real));
             assertEquals(0, opened.lastSequence());
+        }
+    }
+
+    /**
+     * A flush forces, in order: the old log (whatever the sync policy, since only the newest log may
+     * end torn), the new log's directory entry, the table, the directory again (before anything names
+     * the table), the manifest's temp file, and the directory after the rename. A crash test with the
+     * page cache intact can't see a missing force, so they are counted.
+     */
+    @Test
+    void aFlushForcesTheOldLogTheTableAndTheManifest() throws IOException {
+        Path real;
+        try (Store store = Store.open(dir, Options.defaults().withSync(SyncPolicy.NEVER), counting)) {
+            real = store.directory();
+            store.put(utf8("a"), utf8("1"));
+            store.put(utf8("b"), utf8("2"));
+            int dirBefore = forcesOf(real);
+            int logBefore = forcesOf(real.resolve(Store.logName(1)));
+            int manifestBefore = forcesOf(real.resolve(Manifest.TEMP_FILE)); // the new store's, at open
+            store.flush();
+            assertEquals(logBefore + 1, forcesOf(real.resolve(Store.logName(1))), "the old log, at rotation");
+            assertEquals(1, forcesOf(real.resolve(Store.tableName(3))), "the table");
+            assertEquals(manifestBefore + 1, forcesOf(real.resolve(Manifest.TEMP_FILE)), "the manifest, before its rename");
+            assertEquals(dirBefore + 3, forcesOf(real), "the new log's entry, the table's, the rename");
+            assertEquals(List.of(3L), store.tables().stream().map(TableInfo::number).toList());
+        }
+    }
+
+    /** A merge forces its output and the directory before the manifest names it, then the manifest. */
+    @Test
+    void aMergeForcesItsOutputBeforeTheManifestNamesIt() throws IOException {
+        try (Store store = Store.open(dir, Options.defaults().withSync(SyncPolicy.NEVER), counting)) {
+            Path real = store.directory();
+            for (int i = 0; i < 3; i++) {
+                store.put(utf8("k" + i), utf8("v" + i));
+                store.flush();
+            }
+            int dirBefore = forcesOf(real);
+            int manifestBefore = forcesOf(real.resolve(Manifest.TEMP_FILE));
+            store.compactAll();
+            long output = store.tables().get(0).number();
+            assertEquals(1, forcesOf(real.resolve(Store.tableName(output))), "the output");
+            assertEquals(manifestBefore + 1, forcesOf(real.resolve(Manifest.TEMP_FILE)));
+            assertEquals(dirBefore + 2, forcesOf(real), "the output's entry, then the rename");
         }
     }
 

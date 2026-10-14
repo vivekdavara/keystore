@@ -214,6 +214,49 @@ class TableTest {
         }
     }
 
+    /**
+     * FileChannel is interruptible: an interrupted read closes the channel for every thread. Found
+     * while building day 2 (a probe: after one interrupted get, every later read of the table failed
+     * with ClosedChannelException until a reopen). The interrupted read still fails; the next reads,
+     * on any thread, work.
+     */
+    @Test
+    void anInterruptedReadDoesNotBreakTheTableForOthers() throws Exception {
+        Table table = Table.open(write("1.sst", sample(200), 128), 1, PLAIN);
+        try {
+            byte[] key = utf8("k00010");
+            Thread.currentThread().interrupt();
+            try {
+                assertThrows(java.nio.channels.ClosedByInterruptException.class, () -> table.get(key, hash(key)));
+            } finally {
+                Thread.interrupted(); // clear it
+            }
+            assertEquals(Entry.value(6, utf8("v5-xxxxx")), table.get(key, hash(key)), "this thread, after the interrupt");
+            Entry[] fromOther = new Entry[1];
+            Thread other = new Thread(() -> {
+                try {
+                    fromOther[0] = table.get(key, hash(key));
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            });
+            other.start();
+            other.join();
+            assertEquals(Entry.value(6, utf8("v5-xxxxx")), fromOther[0], "another thread");
+            Table.Cursor cursor = table.cursor();
+            int entries = 0;
+            while (cursor.next()) {
+                entries++;
+            }
+            assertEquals(200, entries);
+        } finally {
+            table.release();
+        }
+        byte[] key = utf8("k00010");
+        assertThrows(java.nio.channels.ClosedChannelException.class, () -> table.get(key, hash(key)),
+                "released for good: not reopened");
+    }
+
     @Test
     void theLastReleaseClosesTheFileAndDeletesItIfObsolete() throws IOException {
         Path kept = write("1.sst", sample(10), 4096);

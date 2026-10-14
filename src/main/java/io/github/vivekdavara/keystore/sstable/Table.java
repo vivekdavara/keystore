@@ -6,6 +6,8 @@ import io.github.vivekdavara.keystore.wal.WalFormat;
 import java.io.IOException;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedByInterruptException;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,11 +25,18 @@ import java.util.function.BiFunction;
  * <p>The table counts references, so that a compaction can drop it while reads are still in it: it
  * opens with one, the last {@link #release} closes the file, and deletes it if it was
  * {@link #markObsolete marked obsolete}.
+ *
+ * <p>A {@link FileChannel} is interruptible: a thread interrupted during a read closes the channel,
+ * for every thread. So a read that finds the channel closed while the table still has references
+ * reopens it ({@link #reopen}); the interrupted read itself still fails.
  */
 public final class Table {
     private final Path file;
     private final long number;
-    private final FileChannel channel;
+    private final BiFunction<Path, FileChannel, FileChannel> wrap;
+    private volatile FileChannel channel; // replaced only by reopen, under reopenLock
+    private final Object reopenLock = new Object();
+    private boolean closedForGood; // guarded by reopenLock: the last reference is gone
     private final long fileBytes;
     private final TableFormat.Footer footer;
     private final BloomFilter filter;
@@ -40,10 +49,12 @@ public final class Table {
     private volatile boolean obsolete;
     private final LongAdder blocksRead = new LongAdder();
 
-    private Table(Path file, long number, FileChannel channel, long fileBytes, TableFormat.Footer footer,
-            BloomFilter filter, byte[] smallest, byte[][] lastKeys, long[] blockOffsets, int[] blockLengths) {
+    private Table(Path file, long number, BiFunction<Path, FileChannel, FileChannel> wrap, FileChannel channel,
+            long fileBytes, TableFormat.Footer footer, BloomFilter filter, byte[] smallest, byte[][] lastKeys,
+            long[] blockOffsets, int[] blockLengths) {
         this.file = file;
         this.number = number;
+        this.wrap = wrap;
         this.channel = channel;
         this.fileBytes = fileBytes;
         this.footer = footer;
@@ -64,7 +75,7 @@ public final class Table {
             throws IOException {
         FileChannel channel = wrap.apply(file, FileChannel.open(file, StandardOpenOption.READ));
         try {
-            return read(file, number, channel);
+            return read(file, number, wrap, channel);
         } catch (IOException | RuntimeException | Error e) {
             try {
                 channel.close();
@@ -75,7 +86,8 @@ public final class Table {
         }
     }
 
-    private static Table read(Path file, long number, FileChannel channel) throws IOException {
+    private static Table read(Path file, long number, BiFunction<Path, FileChannel, FileChannel> wrap,
+            FileChannel channel) throws IOException {
         long size = channel.size();
         if (size < TableFormat.FOOTER_BYTES) {
             throw new CorruptTableException(file, size + " bytes is too short for a table");
@@ -133,7 +145,7 @@ public final class Table {
             if (expectedOffset != footer.filterOffset() || in.hasRemaining()) {
                 throw new CorruptTableException(file, "the index doesn't cover the data blocks exactly");
             }
-            return new Table(file, number, channel, size, footer, filter, smallest, lastKeys, offsets, lengths);
+            return new Table(file, number, wrap, channel, size, footer, filter, smallest, lastKeys, offsets, lengths);
         } catch (BufferUnderflowException | IllegalArgumentException e) {
             throw new CorruptTableException(file, "the index ends early or holds a bad length");
         }
@@ -224,7 +236,35 @@ public final class Table {
 
     private byte[] dataBlock(int b) throws IOException {
         blocksRead.increment();
-        return readBlock(file, channel, blockOffsets[b], blockLengths[b], "data block " + b);
+        for (boolean retried = false; ; retried = true) {
+            FileChannel current = channel;
+            try {
+                return readBlock(file, current, blockOffsets[b], blockLengths[b], "data block " + b);
+            } catch (ClosedByInterruptException e) {
+                reopen(current); // this thread was interrupted and closed it for everyone: reopen it for them
+                throw e;
+            } catch (ClosedChannelException e) { // includes AsynchronousCloseException: another thread's interrupt
+                if (retried || !reopen(current)) {
+                    throw e;
+                }
+            }
+        }
+    }
+
+    /**
+     * Replaces a channel an interrupt closed, unless another read already has or the table has
+     * been released for good; returns whether there is a usable channel to retry with.
+     */
+    private boolean reopen(FileChannel closed) throws IOException {
+        synchronized (reopenLock) {
+            if (closedForGood) {
+                return false;
+            }
+            if (channel == closed && !closed.isOpen()) {
+                channel = wrap.apply(file, FileChannel.open(file, StandardOpenOption.READ));
+            }
+            return true;
+        }
     }
 
     private int checkedKeyLength(byte[] block, int at, int b) throws CorruptTableException {
@@ -358,10 +398,13 @@ public final class Table {
             throw new IllegalStateException("table " + number + " released more often than retained");
         }
         if (r == 0) {
-            try {
-                channel.close();
-            } catch (IOException ignored) {
-                // Read-only: nothing to lose.
+            synchronized (reopenLock) {
+                closedForGood = true;
+                try {
+                    channel.close();
+                } catch (IOException ignored) {
+                    // Read-only: nothing to lose.
+                }
             }
             if (obsolete) {
                 try {

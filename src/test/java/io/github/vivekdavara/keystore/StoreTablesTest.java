@@ -119,6 +119,34 @@ class StoreTablesTest {
     }
 
     /**
+     * A merge that doesn't reach the oldest table must keep tombstones: the oldest still has the
+     * value the tombstone hides. Here the oldest table holds k (big, its own tier); the two newer,
+     * small tables (k's tombstone, and x) merge without it.
+     */
+    @Test
+    void aMergeThatMissesTheOldestTableKeepsTombstones() throws IOException {
+        Options options = SMALL.withFlushLogBytes(512).withMergeWidth(2);
+        try (Store store = Store.open(dir, options)) {
+            store.put(utf8("k"), new byte[2_000]);
+            store.flush(); // the oldest table, about 2 KB: not small
+            store.delete(utf8("k"));
+            store.flush();
+            store.put(utf8("x"), utf8("1"));
+            store.flush(); // the two small tables merge
+            assertEquals(1, store.stats().merges());
+            List<TableInfo> tables = store.tables();
+            assertEquals(2, tables.size(), tables.toString());
+            assertEquals(1, tables.get(0).tombstones(), "the merged table kept k's tombstone");
+            assertEquals(Optional.empty(), string(store.get(utf8("k"))), "and k stays deleted");
+            store.compactAll(); // now the oldest is in: the tombstone and the value both go
+            assertEquals(1, store.tables().size());
+            assertEquals(0, store.tables().get(0).tombstones());
+            assertEquals(Optional.empty(), string(store.get(utf8("k"))));
+            assertEquals(Optional.of("1"), string(store.get(utf8("x"))));
+        }
+    }
+
+    /**
      * Size-tiered: a tier merges when it reaches mergeWidth tables, so there are at most
      * mergeWidth - 1 tables per tier, and few tiers.
      */

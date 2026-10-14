@@ -10,21 +10,28 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.vivekdavara.keystore.Bytes;
 import io.github.vivekdavara.keystore.memtable.Entry;
+import io.github.vivekdavara.keystore.wal.WalFormat;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.BiFunction;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class TableTest {
     private static final BiFunction<Path, FileChannel, FileChannel> PLAIN = (path, channel) -> channel;
+    /** Bytes on both sides of 0x80, so that unsigned order matters and many keys are prefixes of others. */
+    private static final byte[] ALPHABET = {0x00, 0x01, 0x41, 0x7f, (byte) 0x80, (byte) 0x81, (byte) 0xfe, (byte) 0xff};
 
     @TempDir
     Path dir;
@@ -201,7 +208,7 @@ class TableTest {
         byte[] good = Files.readAllBytes(file);
         Path cut = dir.resolve("cut.sst");
         for (int length = 0; length < good.length; length++) {
-            Files.write(cut, java.util.Arrays.copyOf(good, length));
+            Files.write(cut, Arrays.copyOf(good, length));
             int at = length;
             assertThrows(CorruptTableException.class, () -> Table.open(cut, 9, PLAIN), "cut at " + at);
         }
@@ -231,4 +238,208 @@ class TableTest {
         assertFalse(Files.exists(dropped));
         assertThrows(IllegalStateException.class, obsolete::release);
     }
+
+    private static void assertSameEntry(Entry expected, Entry actual, String what) {
+        if (expected == null) {
+            assertNull(actual, what);
+            return;
+        }
+        assertTrue(actual != null, what + ": missing");
+        assertEquals(expected.seq(), actual.seq(), what);
+        assertEquals(expected.isTombstone(), actual.isTombstone(), what);
+        if (!expected.isTombstone()) {
+            assertArrayEquals(expected.value(), actual.value(), what);
+        }
+    }
+
+    /**
+     * From the day-2 review: random tables over keys of 1-5 bytes drawn from bytes on both sides of 0x80 (so many keys are
+     * prefixes of others), with empty values, values bigger than a block, and tombstones: every key,
+     * every prefix and one-byte extension of a key, and random probes answer as a TreeMap would.
+     */
+    @Test
+    void randomTablesAnswerEveryLookupExactly() throws IOException {
+        int tables = 0;
+        for (int blockBytes : new int[] {64, 100, 333, 4096}) {
+            for (long seed = 1; seed <= 25; seed++) {
+                Random random = new Random(seed * 31 + blockBytes);
+                TreeMap<byte[], Entry> entries = new TreeMap<>(Bytes.ORDER);
+                int count = 1 + random.nextInt(seed % 5 == 0 ? 3 : 300);
+                long seq = 1;
+                for (int i = 0; i < count; i++) {
+                    byte[] key = new byte[1 + random.nextInt(5)];
+                    for (int j = 0; j < key.length; j++) {
+                        key[j] = ALPHABET[random.nextInt(ALPHABET.length)];
+                    }
+                    int kind = random.nextInt(10);
+                    Entry entry;
+                    if (kind == 0) {
+                        entry = Entry.tombstone(seq++);
+                    } else if (kind == 1) {
+                        entry = Entry.value(seq++, new byte[0]);
+                    } else if (kind == 2) {
+                        byte[] big = new byte[blockBytes * 2 + random.nextInt(50)];
+                        random.nextBytes(big);
+                        entry = Entry.value(seq++, big);
+                    } else {
+                        byte[] value = new byte[random.nextInt(20)];
+                        random.nextBytes(value);
+                        entry = Entry.value(seq++, value);
+                    }
+                    entries.put(key, entry);
+                }
+                Path file = write("t" + (tables++) + ".sst", entries, blockBytes);
+                Table table = Table.open(file, 1, PLAIN);
+                try {
+                    TreeSet<byte[]> probes = new TreeSet<>(Bytes.ORDER);
+                    for (byte[] key : entries.keySet()) {
+                        probes.add(key);
+                        for (int cut = 1; cut < key.length; cut++) {
+                            probes.add(Arrays.copyOf(key, cut));
+                        }
+                        for (byte b : ALPHABET) {
+                            byte[] longer = Arrays.copyOf(key, key.length + 1);
+                            longer[key.length] = b;
+                            probes.add(longer);
+                        }
+                    }
+                    for (int i = 0; i < 500; i++) {
+                        byte[] probe = new byte[1 + random.nextInt(6)];
+                        random.nextBytes(probe);
+                        probes.add(probe);
+                    }
+                    for (byte[] probe : probes) {
+                        assertSameEntry(entries.get(probe), table.get(probe, BloomFilter.hash(probe)),
+                                "seed " + seed + ", blocks of " + blockBytes + ", key " + Bytes.show(probe));
+                    }
+                    Table.Cursor cursor = table.cursor();
+                    int n = 0;
+                    for (Map.Entry<byte[], Entry> e : entries.entrySet()) {
+                        assertTrue(cursor.next(), "cursor ended early at " + n);
+                        assertArrayEquals(e.getKey(), cursor.key());
+                        assertSameEntry(e.getValue(), cursor.entry(), "cursor entry " + n);
+                        n++;
+                    }
+                    assertFalse(cursor.next());
+                    assertFalse(cursor.next(), "stays at the end");
+                } finally {
+                    table.release();
+                }
+            }
+        }
+    }
+
+    /** Keys of the maximum length, differing only in their last byte across 0x80, and a single-entry table. */
+    @Test
+    void maximumLengthKeysAndASingleEntryTable() throws IOException {
+        byte[] prefix = new byte[WalFormat.MAX_KEY_BYTES - 1];
+        Arrays.fill(prefix, (byte) 0x90);
+        byte[] low = Arrays.copyOf(prefix, WalFormat.MAX_KEY_BYTES);
+        low[low.length - 1] = 0x7f;
+        byte[] high = Arrays.copyOf(prefix, WalFormat.MAX_KEY_BYTES);
+        high[high.length - 1] = (byte) 0x80;
+        TreeMap<byte[], Entry> entries = new TreeMap<>(Bytes.ORDER);
+        entries.put(prefix, Entry.value(1, new byte[0]));
+        entries.put(low, Entry.tombstone(2));
+        entries.put(high, Entry.value(3, new byte[] {7}));
+        Table table = Table.open(write("max.sst", entries, 64), 1, PLAIN);
+        try {
+            assertEquals(3, table.blocks());
+            for (Map.Entry<byte[], Entry> e : entries.entrySet()) {
+                assertSameEntry(e.getValue(), table.get(e.getKey(), BloomFilter.hash(e.getKey())), "max-length key");
+            }
+            byte[] between = Arrays.copyOf(prefix, WalFormat.MAX_KEY_BYTES);
+            between[between.length - 1] = 0x00;
+            assertNull(table.get(between, BloomFilter.hash(between)));
+        } finally {
+            table.release();
+        }
+
+        TreeMap<byte[], Entry> one = new TreeMap<>(Bytes.ORDER);
+        one.put(high, Entry.value(9, new byte[100_000]));
+        Table single = Table.open(write("one.sst", one, 64), 2, PLAIN);
+        try {
+            assertSameEntry(one.get(high), single.get(high, BloomFilter.hash(high)), "single entry");
+            assertNull(single.get(low, BloomFilter.hash(low)));
+            assertNull(single.get(prefix, BloomFilter.hash(prefix)));
+            Table.Cursor cursor = single.cursor();
+            assertTrue(cursor.next());
+            assertFalse(cursor.next());
+        } finally {
+            single.release();
+        }
+    }
+
+    /**
+     * Found by review: a block's checksum covered its bytes but not where they were. Two data blocks
+     * of the same length swapped (or one written over the other) passed every check at open, and a
+     * lookup in the block answered "not here" for a key the table has, so a store read fell through
+     * to an older table and returned an overwritten value. The trailer now covers the offset too.
+     */
+    @Test
+    void swappedBlocksOfEqualLengthFailTheirChecksums() throws IOException {
+        TreeMap<byte[], Entry> entries = new TreeMap<>(Bytes.ORDER);
+        for (int i = 0; i < 40; i++) {
+            entries.put(Bytes.utf8(String.format("key%04d", i)), Entry.value(100 + i, Bytes.utf8(String.format("val%04d", i))));
+        }
+        Path file = write("swap.sst", entries, 64);
+        Table good = Table.open(file, 1, PLAIN);
+        int blocks = good.blocks();
+        good.release();
+        assertTrue(blocks >= 3, blocks + " blocks");
+        byte[] bytes = Files.readAllBytes(file);
+        // Every entry is 4 + 7 + 8 + 1 + 4 + 7 = 31 bytes, so with 64-byte blocks each block holds 3 entries: 93 bytes.
+        int blockAndTrailer = 93 + TableFormat.TRAILER_BYTES;
+        byte[] first = Arrays.copyOfRange(bytes, 0, blockAndTrailer);
+        System.arraycopy(bytes, blockAndTrailer, bytes, 0, blockAndTrailer);
+        System.arraycopy(first, 0, bytes, blockAndTrailer, blockAndTrailer);
+        Path damaged = dir.resolve("damaged.sst");
+        Files.write(damaged, bytes);
+
+        Table table = Table.open(damaged, 1, PLAIN); // the filter and index are where they belong
+        try {
+            for (String k : new String[] {"key0001", "key0004"}) { // one key in each swapped block
+                byte[] key = Bytes.utf8(k);
+                CorruptTableException caught = assertThrows(CorruptTableException.class,
+                        () -> table.get(key, BloomFilter.hash(key)), k);
+                assertTrue(caught.getMessage().contains("fails its checksum"), caught.getMessage());
+            }
+            byte[] third = Bytes.utf8("key0007");
+            assertSameEntry(entries.get(third), table.get(third, BloomFilter.hash(third)), "an untouched block still reads");
+            Table.Cursor cursor = table.cursor();
+            assertThrows(CorruptTableException.class, cursor::next);
+        } finally {
+            table.release();
+        }
+    }
+
+    /**
+     * Found by review, with a crafted file whose checksums are all valid: the index's block count was
+     * bounded only by the footer's entry count, so the reader allocated three arrays of that many
+     * elements before finding the index far too short for them, and died of an OutOfMemoryError.
+     * The count is now checked against the index's length first.
+     */
+    @Test
+    void anIndexClaimingAHugeBlockCountIsRefusedBeforeAllocating() throws IOException {
+        TreeMap<byte[], Entry> entries = new TreeMap<>(Bytes.ORDER);
+        entries.put(Bytes.utf8("a"), Entry.value(1, Bytes.utf8("x")));
+        Path file = write("crafted.sst", entries, 64);
+        byte[] bytes = Files.readAllBytes(file);
+        int footerAt = bytes.length - TableFormat.FOOTER_BYTES;
+        ByteBuffer footer = ByteBuffer.wrap(bytes, footerAt, TableFormat.FOOTER_BYTES).slice();
+        int indexOffset = (int) footer.getLong(12);
+        int indexLength = footer.getInt(20);
+        ByteBuffer index = ByteBuffer.wrap(bytes, indexOffset, indexLength).slice();
+        int smallestLength = index.getInt(0);
+        index.putInt(4 + smallestLength, Integer.MAX_VALUE - 8); // the block count
+        byte[] indexBytes = Arrays.copyOfRange(bytes, indexOffset, indexOffset + indexLength);
+        ByteBuffer.wrap(bytes).putInt(indexOffset + indexLength, TableFormat.blockCrc(indexOffset, indexBytes, indexLength));
+        footer.putLong(24, Long.MAX_VALUE / 2); // entries, so the count passes "blocks <= entries"
+        footer.putInt(TableFormat.FOOTER_BYTES - 12, TableFormat.crc(bytes, footerAt, TableFormat.FOOTER_BYTES - 12));
+        Path crafted = dir.resolve("crafted2.sst");
+        Files.write(crafted, bytes);
+        CorruptTableException refused = assertThrows(CorruptTableException.class, () -> Table.open(crafted, 1, PLAIN));
+        assertTrue(refused.getMessage().contains("blocks for"), "refused by the count check: " + refused.getMessage());
+    }
+
 }

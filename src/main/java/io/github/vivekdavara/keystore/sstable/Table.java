@@ -106,8 +106,11 @@ public final class Table {
         try {
             byte[] smallest = key(in);
             int blocks = in.getInt();
-            if (blocks < 1 || blocks > footer.entries()) {
-                throw new CorruptTableException(file, "the index lists " + blocks + " blocks for " + footer.entries() + " entries");
+            // Checked against what the index can hold before anything is allocated for them: the
+            // checksums say the bytes are as written, not that a crafted file's counts are sane.
+            if (blocks < 1 || blocks > footer.entries() || blocks > in.remaining() / TableFormat.MIN_INDEX_ENTRY) {
+                throw new CorruptTableException(file, "the index lists " + blocks + " blocks for " + footer.entries()
+                        + " entries in " + index.length + " bytes");
             }
             byte[][] lastKeys = new byte[blocks][];
             long[] offsets = new long[blocks];
@@ -117,14 +120,15 @@ public final class Table {
                 lastKeys[i] = key(in);
                 offsets[i] = in.getLong();
                 lengths[i] = in.getInt();
-                if (offsets[i] != expectedOffset || lengths[i] < 1) {
+                if (offsets[i] != expectedOffset || lengths[i] < 1
+                        || lengths[i] > footer.filterOffset() - expectedOffset - TableFormat.TRAILER_BYTES) {
                     throw new CorruptTableException(file, "index entry " + i + " doesn't follow the block before it");
                 }
                 if (Bytes.compare(i == 0 ? smallest : lastKeys[i - 1], lastKeys[i]) > 0
                         || (i > 0 && Bytes.compare(lastKeys[i - 1], lastKeys[i]) == 0)) {
                     throw new CorruptTableException(file, "the index's keys are out of order at block " + i);
                 }
-                expectedOffset += lengths[i] + TableFormat.TRAILER_BYTES;
+                expectedOffset += (long) lengths[i] + TableFormat.TRAILER_BYTES;
             }
             if (expectedOffset != footer.filterOffset() || in.hasRemaining()) {
                 throw new CorruptTableException(file, "the index doesn't cover the data blocks exactly");
@@ -149,7 +153,7 @@ public final class Table {
     private static byte[] readBlock(Path file, FileChannel channel, long offset, int length, String what)
             throws IOException {
         byte[] bytes = readAt(file, channel, offset, length + TableFormat.TRAILER_BYTES);
-        if (TableFormat.intAt(bytes, length) != TableFormat.crc(bytes, 0, length)) {
+        if (TableFormat.intAt(bytes, length) != TableFormat.blockCrc(offset, bytes, length)) {
             throw new CorruptTableException(file, what + " at offset " + offset + " fails its checksum");
         }
         return Arrays.copyOf(bytes, length);

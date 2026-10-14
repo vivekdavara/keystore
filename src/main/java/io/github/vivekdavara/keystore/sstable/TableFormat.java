@@ -8,7 +8,8 @@ import java.util.zip.CRC32C;
  *
  * <pre>
  * file         = data block, data block, ..., filter block, index block, footer
- * every block is followed by a 4-byte trailer: the CRC32C of the block's bytes
+ * every block is followed by a 4-byte trailer: the CRC32C of the block's offset in the file
+ * (8 bytes), then the block's bytes, so a block found in the wrong place fails it as well
  *
  * data block   = entry, entry, ...  (keys strictly increasing, across blocks too)
  * entry        = key length (4) | key | seq (8) | kind (1: 1 = value, 2 = tombstone)
@@ -76,6 +77,21 @@ final class TableFormat {
         }
         return footer;
     }
+
+    /**
+     * A block's trailer: the CRC32C of its offset in the file, then its bytes. A checksum of the
+     * bytes alone would pass two blocks of one length swapped, or a block written over another,
+     * and a lookup in such a block finds no key and says so.
+     */
+    static int blockCrc(long position, byte[] bytes, int length) {
+        CRC32C crc = new CRC32C();
+        crc.update(ByteBuffer.allocate(8).putLong(0, position));
+        crc.update(bytes, 0, length);
+        return (int) crc.getValue();
+    }
+
+    /** The smallest index entry: a 1-byte last key with its length, the block's offset and length. */
+    static final int MIN_INDEX_ENTRY = 4 + 1 + 8 + 4;
 
     static int crc(byte[] bytes, int offset, int length) {
         CRC32C crc = new CRC32C();

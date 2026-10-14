@@ -129,7 +129,7 @@ public final class TableWriter {
     private long writeWithTrailer(byte[] bytes, int length) throws IOException {
         long start = offset;
         writeFully(ByteBuffer.wrap(bytes, 0, length));
-        writeFully(ByteBuffer.allocate(TableFormat.TRAILER_BYTES).putInt(0, TableFormat.crc(bytes, 0, length)));
+        writeFully(ByteBuffer.allocate(TableFormat.TRAILER_BYTES).putInt(0, TableFormat.blockCrc(start, bytes, length)));
         offset += length + TableFormat.TRAILER_BYTES;
         return start;
     }

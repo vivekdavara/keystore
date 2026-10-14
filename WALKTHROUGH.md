@@ -1,18 +1,21 @@
 # Keystore walkthrough
 
 Questions an interviewer is likely to ask about this project, with short answers grounded in the code. Each answer
-names the file or test to open. This covers day 1 (the memtable, the write-ahead log, recovery, the store); later
-days add sections.
+names the file or test to open. Day 1 covered the memtable, the write-ahead log, recovery and the store; day 2 adds
+tables, the flush, the manifest, versions and compaction ("Tables and compaction", below).
 
 **Reading order:** DESIGN.md "Write path" and "Recovery" → `Store.write` → `memtable/SkipList.put` →
-`wal/WalFormat` (the table at the top) → `wal/WalReader.read` → `StoreFaultTest` and `StoreLockTest`.
+`wal/WalFormat` (the table at the top) → `wal/WalReader.read` → `StoreFaultTest` and `StoreLockTest`. For day 2:
+DESIGN.md "Tables", "The flush", "Versions" and "Compaction" → `sstable/TableFormat` (the format at the top) →
+`sstable/Table.get` → `Store.flushMemtable`, `Store.get`, `Store.merge` → `Version` → `TableCrashCycleTest` and
+`StoreConcurrencyTest`.
 
 ## The big picture
 
 **What is it, in one sentence?**
-A key-value store built like LevelDB: writes go to a write-ahead log and a sorted in-memory table; on day 2 full
-tables become immutable sorted files (SSTables) that compaction merges, and on day 3 a TCP server and log-shipping
-replication go on top.
+A key-value store built like LevelDB: writes go to a write-ahead log and a sorted in-memory table, which is flushed
+to immutable sorted files (SSTables) that compaction merges; on day 3 a TCP server and log-shipping replication go
+on top.
 
 **Why an LSM tree and not a B-tree?**
 An LSM tree turns random writes into sequential ones: a write is one append to the log plus an in-memory insert,
@@ -209,9 +212,95 @@ About 3 ms: `EVERY_WRITE`'s median put is 2,990 µs, and a C program doing 128-b
 measures 2,994 µs, against 26 µs for a plain `fsync`, which doesn't flush the drive's cache. So the store does about
 360 durable writes a second, and 525,000 under `NEVER`. Group commit is the standard way between the two.
 
+## Tables and compaction (day 2)
+
+**Walk me through a get now.**
+`Store.get` pins the current `Version` (one compare-and-set on its reference count), then looks in the memtable, the
+frozen memtable if a flush is running, and each table newest first, stopping at the first value or tombstone. For a
+table, `Table.get` first checks the key against the table's smallest and largest keys and its Bloom filter, which
+costs no I/O; then it binary-searches the in-memory index for the first block whose last key is at least the key,
+reads that one block with a positional read, checks its checksum, and scans it. Measured with a million keys in four
+tables: a present key p50 2.2 µs, reading 1.02 blocks; an absent key p50 0.1 µs, 0.033 blocks (README, "Results").
+
+**Why is newest-first the right order?**
+Each place holds only writes newer than every place after it: the memtable's are newer than the frozen memtable's,
+which are newer than any table's, and the tables cover disjoint ranges of sequence numbers in age order (the
+manifest checks it). So the first entry found is the newest. That is also why a merge may only take adjacent tables
+(below).
+
+**What's in a table file, and why a sparse index?**
+Data blocks of about 4 KiB (entries in key order), then the Bloom filter, then the index (each block's last key,
+offset and length), then a fixed 72-byte footer with the offsets, counts and a magic number (`sstable/TableFormat`).
+One index entry per block instead of per key keeps the index small enough to hold in memory for every table, under
+1% of the data here; the price is scanning a few dozen entries inside the block.
+
+**How does the Bloom filter work, and why 10 bits a key?**
+Each key sets 7 bits of a bit array, picked by double hashing one 64-bit MurmurHash64A (`BloomFilter.add`); a lookup
+checks the same 7 bits, and any zero means "definitely not here". With b bits a key and k probes the false-positive
+rate is about `(1 - e^(-k/b))^k`, minimised at `k = b ln 2`: 10 bits gives 0.82% in theory and 0.90% measured
+(`BloomFilterTest`). It costs 1.25 bytes a key of memory, and it is what makes a miss cheap: without it, a key a
+table doesn't have would still cost a block read in every table whose range covers it.
+
+**Why does the block checksum include the block's offset?**
+A review found that bytes alone weren't enough: two blocks of one length, swapped, both passed their checksums, and
+a lookup in the wrong block said "not here", so the read went on to an older table and returned an overwritten
+value. Putting the offset into the CRC makes a block in the wrong place fail like a damaged one
+(`TableTest.swappedBlocksOfEqualLengthFailTheirChecksums`).
+
+**What happens if the machine crashes during a flush?**
+The flush (`Store.flushMemtable`) forces and closes the old log and starts a new one, writes and forces the table,
+forces the directory, then renames a new manifest into place; only after that are the old logs deleted. Before the
+rename, the old manifest is in force: recovery replays the old log and the new one, and deletes the table nobody
+names. After it, the new manifest names the table and the new log, and the old log is garbage. `TableCrashCycleTest`
+injects a fault at a random write or force anywhere (249 crashes) and checks every acknowledged write survives;
+moving the log deletion before the manifest fails it at the fourth cycle.
+
+**Why rewrite the manifest whole instead of appending to it?**
+It is tiny (40 bytes plus 32 per table) and changes only on a flush or a merge, so writing a temp file, forcing it
+and renaming it over the old one is cheap, and the rename is atomic: a crash leaves the old manifest or the new one.
+LevelDB appends edits to a manifest log, which scales to thousands of files but needs its own recovery rules.
+
+**What if the manifest is lost?**
+A directory with logs or tables but no `MANIFEST` refuses to open (`StoreTablesTest`). Opening it as a new store
+would have been the easy path, and it would have deleted every table as garbage.
+
+**How do you stop a compaction from closing a file a reader is in?**
+Reference counts at two levels (`Version`, `Table`). A version holds a reference on each of its tables; a read pins
+a version. When a merge installs a new version, the store drops its reference on the old one, but a read still in it
+keeps it, and so its tables, alive; the last release closes the files and deletes those the merge marked obsolete.
+`StoreConcurrencyTest` shows it: without the pin, readers hit `AsynchronousCloseException`.
+
+**Why does pinning retry?**
+A read reads the current version and then tries to increment its count; if the count is already zero, the version
+was released between the two steps, which only happens after a newer version was installed, so reading the field
+again gives that one. The count never goes from zero back up, so a released version can't be resurrected.
+
+**Why size-tiered compaction, and how does it pick?**
+`Compaction.pick` groups adjacent tables, newest first, into tiers of similar size (all small ones together;
+otherwise within half to one and a half times the tier's average, Cassandra's defaults) and merges the newest tier
+with four tables. It writes each key about `log4(data / flush size)` times. Leveled compaction rewrites more but reads
+fewer files; size-tiered is simpler to build and to reason about, and was the plan. Measured: a million random writes
+wrote 3.37 bytes of table per byte of data.
+
+**Why must merged tables be adjacent?**
+Reads trust newest-first order, and each table covers a range of sequence numbers after the next one's. Merge two
+tables with a third between them and the output has to go somewhere: before the third, its old entries hide the
+third's newer ones; after it, the reverse. So a tier is a run of adjacent tables, and the output takes the run's
+place (`CompactionTest.aTableOfAnotherSizeBetweenSimilarOnesSplitsTheTier`).
+
+**When can a tombstone be dropped?**
+Only when the merge includes the oldest table. A tombstone hides older values of its key; dropped while an older
+table still has one, the deleted value would come back. When nothing older exists, the key is just gone, and the
+tombstone goes with it (`StoreTablesTest.compactAllKeepsTheNewestValueAndDropsTombstones`).
+
+**What happens to writes while a flush or merge runs?**
+They wait: both run in the writing thread under the write lock. Reads don't wait. The slowest of a million writes in
+`bench fill` waited 316 ms for a merge. LevelDB and RocksDB do this work on background threads and only slow writers
+down when it falls behind; that's day 4's, with group commit.
+
 ## What's next
 
 **What would you build next?**
-Day 2: flush the memtable to SSTables (sorted blocks, a sparse index, a Bloom filter), a manifest, log rotation, and
-size-tiered compaction. Then the TCP server and replication (day 3), crash tests with a killed process and JMH
-benchmarks (day 4), and group commit if the numbers call for it.
+The TCP server and replication (day 3); crash tests with a killed process, JMH benchmarks, and moving flushes and
+merges to a background thread with group commit (day 4). For the tables themselves: a block cache, prefix
+compression within blocks, and leveled compaction to compare against size-tiered.

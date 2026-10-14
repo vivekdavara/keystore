@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The day-1 measurements in the README. Usage: scripts/bench.sh [runs]   (default 5 runs of each)
+# The measurements in the README. Usage: scripts/bench.sh [runs] [day]   (default 5 runs of each, both days)
 # Each line is one run (after a warm-up run inside the JVM); the README reports medians.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -13,6 +13,17 @@ bench() { "$JAVA_HOME/bin/java" -Xmx4g -cp "$cp" io.github.vivekdavara.keystore.
 # The raw cost of a durable append, without Java: fsync against F_FULLFSYNC (macOS) or fdatasync (Linux).
 cc -O2 -o target/fsync_cost scripts/fsync_cost.c
 for _ in $(seq "$runs"); do target/fsync_cost target 1000; done
+
+day="${2:-all}"
+if [ "$day" = all ] || [ "$day" = 2 ]; then
+    # Day 2: flushes, merges and reads from tables.
+    for _ in $(seq "$runs"); do bench fill 1000000 100; done
+    for bits in 1 5 10 16; do
+        for _ in $(seq "$runs"); do bench reads 1000000 100 "$bits"; done
+    done
+    for _ in $(seq "$runs"); do bench writes NEVER 200000 100; done
+    [ "$day" = 2 ] && exit 0
+fi
 
 for _ in $(seq "$runs"); do bench writes EVERY_WRITE 1000 100; done
 for _ in $(seq "$runs"); do bench writes NEVER 200000 100; done

@@ -95,6 +95,11 @@ public final class Store implements Closeable {
     private Throwable failure; // guarded by writeLock
     private boolean failedFlush; // guarded by writeLock: the failure came from forcing the log on a write
     private volatile boolean closed;
+    private long flushes; // guarded by writeLock, like the counts below
+    private long flushedBytes;
+    private long merges;
+    private long mergeInputBytes;
+    private long mergedBytes;
 
     private Store(
             Path dir, Object identity, Options options, BiFunction<Path, FileChannel, FileChannel> wrap,
@@ -504,6 +509,8 @@ public final class Store implements Closeable {
         }
         install(new Version(active, null, tables));
         table.release(); // the version holds it
+        flushes++;
+        flushedBytes += table.fileBytes();
         deleteLogsBefore(newLog);
     }
 
@@ -595,7 +602,12 @@ public final class Store implements Closeable {
         }
         Version before = current;
         install(new Version(before.active, before.frozen, result));
+        merges++;
+        for (Table input : inputs) {
+            mergeInputBytes += input.fileBytes();
+        }
         if (output != null) {
+            mergedBytes += output.fileBytes();
             output.release();
         }
     }
@@ -749,6 +761,24 @@ public final class Store implements Closeable {
                     t.largestSeq(), t.blocksRead()));
         }
         return out;
+    }
+
+    /**
+     * What the store has written to tables since it opened.
+     *
+     * @param flushedBytes bytes of the tables flushes wrote
+     * @param mergeInputBytes bytes of the tables merges read
+     * @param mergedBytes bytes of the tables merges wrote
+     */
+    public record Stats(long flushes, long flushedBytes, long merges, long mergeInputBytes, long mergedBytes) {}
+
+    public Stats stats() {
+        writeLock.lock();
+        try {
+            return new Stats(flushes, flushedBytes, merges, mergeInputBytes, mergedBytes);
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     /** The manifest as last written. */

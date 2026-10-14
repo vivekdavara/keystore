@@ -24,13 +24,17 @@ import java.util.function.Function;
 import java.util.stream.Stream;
 
 /**
- * The day-1 measurements in the README, run by {@code scripts/bench.sh}. Plain wall-clock timings,
- * not JMH (that's day 4): the first run of each is a warm-up and is thrown away, and each line
- * reports one run; the script runs several and the README gives medians.
+ * The measurements in the README, run by {@code scripts/bench.sh}. Plain wall-clock timings, not
+ * JMH (that's day 4): the first run of each is a warm-up and is thrown away, and each line reports
+ * one run; the script runs several and the README gives medians.
  *
  * <pre>
  * writes SYNC COUNT VALUE_BYTES   puts of 16-byte keys into a new store; throughput and latency
- * recover COUNT VALUE_BYTES       time to open a store whose log holds COUNT puts
+ * recover COUNT VALUE_BYTES       time to open a store whose one log holds COUNT puts (no flush)
+ * fill COUNT VALUE_BYTES          COUNT puts in random key order under NEVER with the default flush
+ *                                 and merges: throughput, latency, bytes written to tables, reopen
+ * reads COUNT VALUE_BYTES BITS    gets of present and absent keys once COUNT keys are in tables
+ *                                 with Bloom filters of BITS bits a key
  * scan TAIL_BYTES zeros|random    time to read a log of one record and a damaged tail
  * memory COUNT VALUE_BYTES        heap bytes per key in a memtable, against approximateBytes
  * skiplist COUNT                  inserts and lookups: this skip list against ConcurrentSkipListMap
@@ -43,6 +47,8 @@ public final class Bench {
         switch (args[0]) {
             case "writes" -> writes(SyncPolicy.valueOf(args[1]), Integer.parseInt(args[2]), Integer.parseInt(args[3]));
             case "recover" -> recover(Integer.parseInt(args[1]), Integer.parseInt(args[2]));
+            case "fill" -> fill(Integer.parseInt(args[1]), Integer.parseInt(args[2]));
+            case "reads" -> reads(Integer.parseInt(args[1]), Integer.parseInt(args[2]), Integer.parseInt(args[3]));
             case "scan" -> scan(Integer.parseInt(args[1]), args[2]);
             case "memory" -> memory(Integer.parseInt(args[1]), Integer.parseInt(args[2]));
             case "skiplist" -> skiplist(Integer.parseInt(args[1]));
@@ -83,7 +89,9 @@ public final class Bench {
         Path dir = Files.createTempDirectory("keystore-bench");
         try {
             byte[] value = randomBytes(valueBytes, 2);
-            try (Store store = Store.open(dir, Options.defaults().withSync(SyncPolicy.NEVER))) {
+            // No flush, so the log holds every write: this measures replaying a log, as on day 1.
+            Options noFlush = Options.defaults().withFlushLogBytes(Long.MAX_VALUE);
+            try (Store store = Store.open(dir, noFlush.withSync(SyncPolicy.NEVER))) {
                 for (int i = 0; i < count; i++) {
                     store.put(key(i), value);
                 }
@@ -91,7 +99,7 @@ public final class Bench {
             long logBytes = Files.size(dir.resolve("000001.log"));
             for (int run = 0; run < 2; run++) {
                 long start = System.nanoTime();
-                try (Store store = Store.open(dir)) {
+                try (Store store = Store.open(dir, noFlush)) {
                     long end = System.nanoTime();
                     if (store.lastSequence() != count) {
                         throw new AssertionError("recovered " + store.lastSequence() + " of " + count);
@@ -107,6 +115,117 @@ public final class Bench {
         } finally {
             delete(dir);
         }
+    }
+
+    private static void fill(int count, int valueBytes) throws IOException {
+        byte[] value = randomBytes(valueBytes, 7);
+        int[] order = shuffled(count, 8);
+        Options options = Options.defaults().withSync(SyncPolicy.NEVER);
+        for (int run = 0; run < 2; run++) { // run 0 warms up
+            Path dir = Files.createTempDirectory("keystore-bench");
+            try {
+                long[] latencies = new long[count];
+                long start;
+                long end;
+                Store.Stats stats;
+                int tables;
+                try (Store store = Store.open(dir, options)) {
+                    start = System.nanoTime();
+                    for (int i = 0; i < count; i++) {
+                        long t0 = System.nanoTime();
+                        store.put(key(order[i]), value);
+                        latencies[i] = System.nanoTime() - t0;
+                    }
+                    end = System.nanoTime();
+                    stats = store.stats();
+                    tables = store.tables().size();
+                }
+                long t0 = System.nanoTime();
+                try (Store store = Store.open(dir, options)) {
+                    long t1 = System.nanoTime();
+                    if (store.lastSequence() != count || store.get(key(order[count / 2])).isEmpty()) {
+                        throw new AssertionError("reopened at " + store.lastSequence());
+                    }
+                    if (run == 1) {
+                        Arrays.sort(latencies);
+                        double user = (double) count * (16 + valueBytes);
+                        System.out.printf("fill count=%d value=%dB: %.0f writes/s, p50 %.1f us, p99 %.1f us, p99.9 %.1f us,"
+                                        + " max %.1f ms; %d flushes, %d merges, %d tables; table bytes written per byte of"
+                                        + " keys and values %.2f (flushes %.2f, merges %.2f); reopen %.0f ms%n",
+                                count, valueBytes, count / seconds(start, end), micros(latencies[count / 2]),
+                                micros(latencies[(int) (count * 0.99)]), micros(latencies[(int) (count * 0.999)]),
+                                latencies[count - 1] / 1e6, stats.flushes(), stats.merges(), tables,
+                                (stats.flushedBytes() + stats.mergedBytes()) / user, stats.flushedBytes() / user,
+                                stats.mergedBytes() / user, seconds(t0, t1) * 1e3);
+                    }
+                }
+            } finally {
+                delete(dir);
+            }
+        }
+    }
+
+    /**
+     * COUNT keys (the even numbers, in random order) put and flushed, so every key is in a table;
+     * then 200,000 gets of present keys and 200,000 of absent ones (the odd numbers, between them),
+     * twice, the first pass a warm-up. Blocks a get counts the data blocks read, from the tables'
+     * own counters. The page cache is warm: these are CPU and system-call costs, not disk reads.
+     */
+    private static void reads(int count, int valueBytes, int bits) throws IOException {
+        byte[] value = randomBytes(valueBytes, 9);
+        Options options = Options.defaults().withSync(SyncPolicy.NEVER).withBloomBitsPerKey(bits);
+        Path dir = Files.createTempDirectory("keystore-bench");
+        try {
+            try (Store store = Store.open(dir, options)) {
+                for (int i : shuffled(count, 10)) {
+                    store.put(key(2 * i), value);
+                }
+                store.flush();
+            }
+            try (Store store = Store.open(dir, options)) {
+                int gets = 200_000;
+                int[] present = new int[gets];
+                SplittableRandom random = new SplittableRandom(11);
+                for (int i = 0; i < gets; i++) {
+                    present[i] = random.nextInt(count);
+                }
+                for (int run = 0; run < 2; run++) {
+                    String[] kinds = {"present", "absent"};
+                    StringBuilder line = new StringBuilder();
+                    for (String kind : kinds) {
+                        long blocksBefore = blocksRead(store);
+                        long[] latencies = new long[gets];
+                        for (int i = 0; i < gets; i++) {
+                            byte[] key = key(kind.equals("present") ? 2 * present[i] : 2 * present[i] + 1);
+                            long t0 = System.nanoTime();
+                            boolean found = store.get(key).isPresent();
+                            latencies[i] = System.nanoTime() - t0;
+                            if (found != kind.equals("present")) {
+                                throw new AssertionError(kind + " key " + present[i]);
+                            }
+                        }
+                        double blocks = (blocksRead(store) - blocksBefore) / (double) gets;
+                        Arrays.sort(latencies);
+                        line.append(String.format("; %s: p50 %.1f us, p99 %.1f us, %.3f blocks a get", kind,
+                                micros(latencies[gets / 2]), micros(latencies[(int) (gets * 0.99)]), blocks));
+                    }
+                    if (run == 1) {
+                        System.out.printf("reads count=%d value=%dB bits=%d: %d tables%s%n",
+                                count, valueBytes, bits, store.tables().size(), line);
+                    }
+                }
+            }
+        } finally {
+            delete(dir);
+        }
+    }
+
+    private static long blocksRead(Store store) {
+        long sum = 0;
+        for (var table : store.tables()) {
+            sum += table.blocksRead();
+        }
+        return sum;
     }
 
     private static void scan(int tailBytes, String kind) throws IOException {

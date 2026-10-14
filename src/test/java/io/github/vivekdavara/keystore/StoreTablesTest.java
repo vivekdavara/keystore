@@ -99,6 +99,11 @@ class StoreTablesTest {
             store.compactAll();
             List<TableInfo> tables = store.tables();
             assertEquals(1, tables.size());
+            Store.Stats stats = store.stats();
+            assertEquals(4, stats.flushes());
+            assertEquals(1, stats.merges(), "the fourth flush made a tier of four; compactAll found one table");
+            assertEquals(tables.get(0).fileBytes(), stats.mergedBytes());
+            assertTrue(stats.mergeInputBytes() < stats.flushedBytes() + 1 && stats.mergeInputBytes() > 0, stats.toString());
             assertEquals(20, tables.get(0).entries(), "the odd keys");
             assertEquals(0, tables.get(0).tombstones());
             for (int i = 0; i < 40; i++) {

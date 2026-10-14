@@ -1,12 +1,14 @@
 # Keystore
 
 An LSM-tree key-value store in Java 21, built the way LevelDB and RocksDB are: a write-ahead log with CRC32C
-checksums, an in-memory skip list, and (from day 2) SSTables with Bloom filters and size-tiered compaction, then a
-TCP server and leader-follower replication by log shipping.
+checksums, an in-memory skip list, SSTables with a sparse index and Bloom filters, and size-tiered compaction; then
+(from day 3) a TCP server and leader-follower replication by log shipping.
 
-**Status: day 1 of 5.** Day 1 is the write path's foundation: the memtable (a hand-written skip list with lock-free
-reads), the write-ahead log, crash recovery, and `put`/`get`/`delete` on top. Everything lives in memory and in one
-log file; SSTables come on day 2. [DESIGN.md](DESIGN.md) has the design and the plan for days 2–5.
+**Status: day 2 of 5.** Day 1 built the write path's foundation: the memtable (a hand-written skip list with
+lock-free reads), the write-ahead log, crash recovery, and `put`/`get`/`delete`. Day 2 made it an LSM tree: the
+memtable is flushed to immutable tables when the log reaches 4 MiB, a manifest names the live tables, reads go
+through the memtable and then the tables newest first, and tables of similar size are merged. No external
+dependencies beyond JUnit. [DESIGN.md](DESIGN.md) has the design and the plan for days 3–5.
 
 ## Why
 
@@ -19,20 +21,27 @@ rather than only getting the happy path fast. Every claim below has a test or a 
 ```mermaid
 flowchart LR
     client[client] -->|"put / delete"| store[Store<br/>one writer at a time]
-    client -->|"get (no lock)"| mem
-    store -->|"1. append record<br/>2. force (EVERY_WRITE)"| wal[(wal.log<br/>CRC32C records)]
+    store -->|"1. append record<br/>2. force (EVERY_WRITE)"| wal[(newest log<br/>CRC32C records)]
     store -->|"3. apply"| mem[memtable<br/>skip list]
-    wal -->|"replay on open"| recovery[recovery:<br/>torn tail or damage?]
-    recovery --> mem
+    mem -->|"log at 4 MiB:<br/>freeze, flush"| sst[(tables, newest first<br/>sparse index + Bloom filter)]
+    sst -->|"merge a tier of 4<br/>similar sizes"| sst
+    manifest[(MANIFEST<br/>live tables, oldest log)] -.- sst
+    client -->|"get: pin a version (no lock)"| mem
+    mem -.->|"miss"| sst
 ```
 
 - **Write path.** A write is appended to the log, forced to the device under `SyncPolicy.EVERY_WRITE` (the default),
-  applied to the memtable, and only then acknowledged.
-- **Read path.** `get` reads the memtable without taking a lock.
-- **Recovery.** Opening a store replays the log: the longest run of good records is applied, and what follows the
-  first bad record is classified. Damage with nothing intact after it is a torn tail, which is what a crash leaves:
-  it is truncated and the store opens. Damage followed by intact records means writes were made after it: the store
-  refuses to open (by default) rather than silently drop them.
+  applied to the memtable, and only then acknowledged. When the log has reached 4 MiB, the write first flushes: the
+  log is forced and a new one started, the memtable is frozen and written to a table, and a new manifest names the
+  table. Then any tier of four similar-sized tables is merged into one.
+- **Read path.** `get` takes no lock: it pins an immutable version (the memtable, the frozen memtable, the tables)
+  and looks in that order, newest first. A table whose key range or Bloom filter rules the key out costs no disk
+  read; otherwise its sparse index names the one 4 KiB block to read.
+- **Recovery.** Opening a store reads the manifest, checks its tables, and replays only the logs the tables don't
+  cover. In the newest log, the longest run of good records is applied and what follows the first bad record is
+  classified: damage with nothing intact after it is a torn tail, which is what a crash leaves, and is truncated;
+  damage followed by intact records means writes were made after it, and the store refuses to open (by default)
+  rather than silently drop them. Then files the manifest doesn't account for are deleted.
 
 The details, and why each choice was made, are in [DESIGN.md](DESIGN.md).
 
@@ -115,6 +124,15 @@ try (Store store = Store.open(Path.of("target/demo"))) {
 | Every new directory's parent, the log's directory on every open, and a truncation are forced; a refused open leaks no file descriptor | `DurabilityTest` |
 | 200 crash-and-recover cycles (a write dying at a random byte, zero or garbage tails) leave exactly the acknowledged writes, 3 seeds | `CrashCycleTest` |
 | The `keystore` command, including a read-only dump of a damaged log | `MainTest` |
+| **Day 2** | |
+| Tables: every entry reads back; random tables answer every key, prefix and extension as a `TreeMap` does; every bit flip, every cut and two swapped blocks are caught; a crafted index count is refused | `TableTest` |
+| The Bloom filter's false-positive rate is near the formula's; its hash matches the reference C code | `BloomFilterTest` |
+| The manifest round-trips, every bit flip and cut is caught, a torn temp file leaves the old one, inconsistent fields are refused | `ManifestTest` |
+| Reads across the memtable and tables, newest wins, tombstones hide older values; merges keep the count down; a flush failing at the manifest loses nothing; no manifest or a damaged table refuses the open | `StoreTablesTest` |
+| Which adjacent tables a merge takes | `CompactionTest` |
+| 360 crash-and-recover cycles with faults anywhere (appends, tables, the manifest, directory forces), 249 crashes, against the acknowledged writes | `TableCrashCycleTest` |
+| A flush and a merge force each file they must, in order | `DurabilityTest` |
+| Four readers alongside constant flushes and merges never miss a key or read a stale value; no file is left open or behind | `StoreConcurrencyTest` |
 
 Most of the mechanisms these tests cover were also checked the other way round: removed in a copy of the file, a
 test had to fail, and the file was restored. DESIGN.md, "Testing", lists which.
@@ -192,6 +210,25 @@ each finding again before fixing it. Every fix has a test that fails without it.
   100 times in 100; the counter that makes the test's checks exact also hides a missing edge. That property rests on
   the argument in DESIGN.md, and would need a jcstress-style harness to test.
 
+## Review of day 2
+
+Two review agents started on the day's code at `6314e01`, one on the table format and recovery, one on the store's
+flushes, merges and concurrency, each in its own git worktree. Both were cut off by an account usage limit after
+about six minutes. The first had already written its findings as tests, which I reproduced and fixed:
+
+- **Two data blocks of the same length, swapped, passed every check**, and a lookup in such a block answered "not
+  here" for a key the table has: a store read would fall through to an older table and return an overwritten value.
+  The block checksum covered the block's bytes but not where they were. It now covers the offset too, so a block
+  found in the wrong place (a misdirected write, say) fails its checksum.
+- **A crafted table whose checksums were all valid could claim an index of 2^31 blocks**, and the reader allocated
+  arrays for them before noticing the index was far too short, dying of an `OutOfMemoryError`. The count is now
+  checked against the index's length first, and block lengths against the data region.
+- Its oracle test (random tables over keys on both sides of 0x80, every prefix and extension of every key probed)
+  and its maximum-length-key test passed, and are now part of `TableTest`.
+
+The second agent left nothing, so it was run again after the limit reset, on failure handling during flushes and
+merges (below, if it found anything).
+
 ## Design decisions
 
 - **A hand-written skip list, one writer, lock-free readers.** Writes are serialised anyway (one log), so the skip
@@ -208,11 +245,27 @@ each finding again before fixing it. Every fix has a test that fails without it.
   directories keyed by file key, because POSIX locks are per process and closing any descriptor releases them.
 - **Bounded, fail-closed recovery.** The scan that tells a torn tail from damage has a budget; when it can't decide,
   it refuses rather than guess.
+- **The manifest is the only list of live files, rewritten whole and renamed into place.** Anything it doesn't
+  name is garbage, deleted once recovery has succeeded; a directory with tables but no manifest is refused rather
+  than opened as a new store, which would delete them.
+- **Immutable versions with reference counts for reads.** A read pins one snapshot of the memtable, the frozen
+  memtable and the tables, so it never sees a key between two places, and a table a merge dropped stays open until
+  the last read in it is done. A read costs one atomic increment and one decrement.
+- **Size-tiered compaction over adjacent tables only.** Each table covers a contiguous range of sequence numbers, so
+  newest-first is a valid read order; merging only adjacent tables keeps it so. Tombstones are dropped only by a
+  merge that reaches the oldest table.
+- **Block checksums that cover the block's offset**, so a block in the wrong place fails like a damaged one.
+- **Flush before the write that finds the log full**, not after, so a failed flush fails a write that was never
+  made.
 
 ## Limitations
 
-- Day 1 keeps everything in memory and never trims the log; SSTables, log rotation and compaction are day 2.
+- Flushes and merges run in the writing thread, under the write lock: the write that triggers one waits for it
+  (reads don't). Background compaction is day 4's, with group commit.
 - Writes are serialised, and under `EVERY_WRITE` each waits for its own device flush; there is no group commit yet.
+- A merge takes a whole tier, so it needs as much free space as the tier; tombstones live until a merge reaches the
+  oldest table.
+- No block cache, no compression, no range scans or snapshots yet.
 - Damage that reaches the end of the log is indistinguishable from a torn write, so it is dropped as one, however
   many records it covers.
 - A value that holds an encoded log record can make recovery refuse to open after an ordinary crash; the default

@@ -94,6 +94,11 @@ public final class Store implements Closeable {
     private volatile Version current;
     private Throwable failure; // guarded by writeLock
     private boolean failedFlush; // guarded by writeLock: the failure came from forcing the log on a write
+    /**
+     * Guarded by writeLock: a flush forced and closed the log, and starting the next one failed, so
+     * {@link #log} is closed but everything in it is on the device.
+     */
+    private boolean rotatedOut;
     private volatile boolean closed;
     private long flushes; // guarded by writeLock, like the counts below
     private long flushedBytes;
@@ -285,7 +290,9 @@ public final class Store implements Closeable {
 
         // Recovery succeeded: remove what the manifest doesn't account for. Best effort: a file that
         // can't be deleted now is removed by the next open, and failing here would fail an open
-        // whose recovery is done (and leave the newest log's channel open).
+        // whose recovery is done (and leave the newest log's channel open). The deletions come
+        // after the directory was forced (opening the newest log forces it), so the manifest they
+        // follow from, perhaps renamed into place just before a crash, is on the device first.
         for (long number : logs) {
             if (number < manifest.logNumber()) {
                 deleteQuietly(real.resolve(logName(number)));
@@ -491,9 +498,11 @@ public final class Store implements Closeable {
         }
         long newLog = nextFileNumber++;
         log.close(); // forces first; if it throws, the old log is still the store's, and closed
+        rotatedOut = true; // until the new log is in place: if opening it fails, close has nothing to force
         log = WriteAheadLog.open(dir.resolve(logName(newLog)), lastSeq.get() + 1, options.recovery(), r -> {
             throw new IllegalStateException("a new log holds a record: " + r);
         }, options.maxLogBytes(), wrap).log();
+        rotatedOut = false;
         MemTable active = new MemTable();
         install(new Version(active, frozen, before.tables));
 
@@ -843,6 +852,11 @@ public final class Store implements Closeable {
     }
 
     private void closeLog() throws IOException {
+        if (rotatedOut) {
+            // A flush forced and closed the log, then failed to start the next one. Found by review:
+            // this read as a log close couldn't force, and close threw under NEVER for nothing.
+            return;
+        }
         if (failure == null || (!failedFlush && log.isOpen())) {
             log.close(); // forces, then closes
             return;

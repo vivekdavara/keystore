@@ -756,7 +756,7 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
 
 **Day 3's tests:**
 
-- **The protocol** (`ProtocolTest`): every command; 30 lines that aren't requests (spacing, case, signs, leading
+- **The protocol** (`ProtocolTest`): every command; 29 lines that aren't requests (spacing, case, signs, leading
   zeros, lengths one past each limit, non-ASCII digits); lines at and past 128 bytes; every kind of unprintable byte;
   error lines that a client can read back.
 - **The server** (`ServerTest`): keys and values of every byte value, the longest key, a 3 MiB value; 2,000

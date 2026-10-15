@@ -1,14 +1,17 @@
 # Keystore
 
 An LSM-tree key-value store in Java 21, built the way LevelDB and RocksDB are: a write-ahead log with CRC32C
-checksums, an in-memory skip list, SSTables with a sparse index and Bloom filters, and size-tiered compaction; then
-(from day 3) a TCP server and leader-follower replication by log shipping.
+checksums, an in-memory skip list, SSTables with a sparse index and Bloom filters, and size-tiered compaction; a TCP
+server with a small text protocol; and leader-follower replication by shipping the write-ahead log.
 
-**Status: day 2 of 5.** Day 1 built the write path's foundation: the memtable (a hand-written skip list with
+**Status: day 3 of 5.** Day 1 built the write path's foundation: the memtable (a hand-written skip list with
 lock-free reads), the write-ahead log, crash recovery, and `put`/`get`/`delete`. Day 2 made it an LSM tree: the
 memtable is flushed to immutable tables when the log reaches 4 MiB, a manifest names the live tables, reads go
-through the memtable and then the tables newest first, and tables of similar size are merged. No external
-dependencies beyond JUnit. [DESIGN.md](DESIGN.md) has the design and the plan for days 3–5.
+through the memtable and then the tables newest first, and tables of similar size are merged. Day 3 put it on the
+network: a server (a virtual thread a connection, lengths before binary data), and followers that apply the
+leader's log records under the leader's sequence numbers, read by the leader from its own log files, and catch up
+from their own last sequence number after any break. No external dependencies beyond JUnit.
+[DESIGN.md](DESIGN.md) has the design and the plan for days 4–5.
 
 ## Why
 
@@ -28,6 +31,9 @@ flowchart LR
     manifest[(MANIFEST<br/>live tables, oldest log)] -.- sst
     client -->|"get: pin a version (no lock)"| mem
     mem -.->|"miss"| sst
+    tcp[Server<br/>PUT / GET / DEL over TCP] --> store
+    wal -->|"SYNC: log records,<br/>read from the log files"| follower[Follower<br/>its own Store, read-only server]
+    follower -.->|"ACK seq"| tcp
 ```
 
 - **Write path.** A write is appended to the log, forced to the device under `SyncPolicy.EVERY_WRITE` (the default),
@@ -42,6 +48,15 @@ flowchart LR
   classified: damage with nothing intact after it is a torn tail, which is what a crash leaves, and is truncated;
   damage followed by intact records means writes were made after it, and the store refuses to open (by default)
   rather than silently drop them. Then files the manifest doesn't account for are deleted.
+- **Server.** A request is a line naming a command and the lengths of the key and value that follow it (`PUT 4 6`,
+  then `cityBoston`); the reply is a line (`OK 1`). Each connection is a virtual thread; replies come in request
+  order and are flushed when no further request is waiting, so pipelined requests share writes.
+- **Replication.** A follower sends `SYNC n` with the sequence number after its store's last; the leader streams
+  every record from `n` on, exactly as its log holds them (checksum included), read from its own log files, then
+  follows new writes. The follower checks each record's checksum and sequence number and applies whatever has
+  arrived as one batch (one force) into its own log; it acknowledges each batch, and after any break reconnects
+  and asks from wherever its store got to. The leader keeps 64 MiB of flushed logs for followers; one further
+  behind is told `BEHIND` and stops (it needs a copy of the tables: day 4).
 
 The details, and why each choice was made, are in [DESIGN.md](DESIGN.md).
 
@@ -105,6 +120,37 @@ try (Store store = Store.open(Path.of("target/demo"))) {
 }
 ```
 
+**A leader and a follower.** Each runs until Ctrl-C (or SIGTERM), then closes its store. In one terminal:
+
+```bash
+scripts/keystore serve target/leader 8104
+```
+
+In another:
+
+```bash
+scripts/keystore follow target/follower 8105 127.0.0.1:8104
+```
+
+Then write to the leader and read from the follower:
+
+```bash
+scripts/keystore client 127.0.0.1:8104 put city Boston
+```
+
+```bash
+scripts/keystore client 127.0.0.1:8105 get city
+```
+
+```bash
+scripts/keystore client 127.0.0.1:8105 info
+```
+
+`put` prints the write's sequence number, `1`; `get` prints `Boston`; and the follower's `info` prints
+`role=follower seq=1 connections=1 state=STREAMING leader=127.0.0.1:8104 leaderSeq=1 lag=0 connects=1`. A `put` to
+the follower gets `READONLY`. `scripts/replication-demo.sh` does all of this with both servers in the background, and
+CI runs it on Linux and macOS.
+
 ## Tests
 
 `mvn verify` runs them all; the tests that make each failure happen are the interesting ones:
@@ -134,6 +180,14 @@ try (Store store = Store.open(Path.of("target/demo"))) {
 | A flush and a merge force each file they must, in order | `DurabilityTest` |
 | A fault at every single write and force of a flush, a merge and a write that flushes, both sync policies, then close and reopen: nothing acknowledged lost, close's answer right (from the review) | `FlushMergeFaultCloseTest` |
 | Four readers alongside constant flushes and merges never miss a key or read a stale value; no file is left open or behind | `StoreConcurrencyTest` |
+| **Day 3** | |
+| Every command parses; 29 lines that aren't requests (spacing, case, signs, leading zeros, lengths one past each limit) are refused before anything is allocated | `ProtocolTest` |
+| Any bytes as keys and values; 2,000 pipelined requests answered in order; bad requests get `ERR PROTOCOL` and a closed connection; a follower refuses writes; the connection limit; 8 concurrent clients get distinct, ordered sequence numbers | `ServerTest` |
+| `replicate` takes the leader's numbers or nothing; one force for a batch; `awaitSequence` wakes on a write and on close | `ReplicateTest` |
+| Retention keeps an unbroken run of the newest covered logs, across flushes and reopens | `LogRetentionTest` |
+| A tail reads every record in order across logs, follows a writer through 20,000 writes, flushes and merges, reads on through a deleted log, says `BEHIND` when a log is gone, and never returns a damaged record | `LogTailTest` |
+| A follower gets every write live, catches up late, after its own restart, after a broken connection and after the leader's restart; `BEHIND` and `AHEAD` stop it; a silent follower is dropped; every key compared | `ReplicationTest` |
+| `keystore serve`, `follow` and `client` end to end | `MainTest`, `scripts/replication-demo.sh` |
 
 Most of the mechanisms these tests cover were also checked the other way round: removed in a copy of the file, a
 test had to fail, and the file was restored. DESIGN.md, "Testing", lists which.
@@ -327,6 +381,18 @@ writes. Nothing acknowledged was lost and the manifest never named a missing tab
 - **Block checksums that cover the block's offset**, so a block in the wrong place fails like a damaged one.
 - **Flush before the write that finds the log full**, not after, so a failed flush fails a write that was never
   made.
+- **Ship the log, as bytes, from the log files.** The leader sends each record exactly as its log holds it, so the
+  follower checks the checksum of what was written; and it reads them from its own files rather than a queue in
+  memory, so catching up after an hour and following live writes are one code path, and the writer never waits for
+  a follower.
+- **Ship only acknowledged writes.** A tail never reads past `lastSequence()`, so it never sees a write in progress,
+  and under `EVERY_WRITE` a follower never has a write the leader could lose in a crash.
+- **A follower's position is its store's `lastSequence()`.** No separate position file: after a crash it asks for
+  whatever comes after what its store recovered.
+- **Group commit on the follower.** Whatever has arrived is applied in one batch, with one force, so a follower that
+  forces keeps up with a leader that doesn't.
+- **Virtual threads, never interrupted.** One per connection keeps the server's code straight-line; an interrupt
+  would close the store's log channel, so shutdown closes sockets instead.
 
 ## Limitations
 
@@ -342,6 +408,12 @@ writes. Nothing acknowledged was lost and the manifest never named a missing tab
   errs on the side of refusing (a test shows the case).
 - Interrupting a writing thread closes the log's channel and stops the store's writes until a reopen. (An
   interrupted reader only fails its own read.)
+- Replication is asynchronous, with no failover: a write the leader acknowledged may be on no follower yet, and a
+  follower's reads can be stale by its lag (`info` shows it).
+- A follower that falls further behind than the leader's kept logs stops as `BEHIND` until day 4's snapshots.
+- A leader under `NEVER` that loses acknowledged writes in a crash and then takes new ones can leave a follower with
+  a different history at those sequence numbers, undetected (`AHEAD` catches it only if the follower asks first).
+- No authentication or TLS; the server listens on the loopback address.
 
 DESIGN.md's "Limitations" has the full list.
 

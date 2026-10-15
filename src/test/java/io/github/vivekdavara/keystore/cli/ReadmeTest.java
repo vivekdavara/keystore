@@ -27,7 +27,10 @@ class ReadmeTest {
         String section = readme.substring(readme.indexOf("## Run it"), readme.indexOf("## Tests"));
 
         List<String[]> commands = new ArrayList<>();
-        Matcher command = Pattern.compile("```bash\nscripts/keystore (.+)\n```").matcher(section);
+        // The commands on a store directory; the server commands (serve, follow, client) run until stopped,
+        // and scripts/replication-demo.sh runs those in CI.
+        Matcher command = Pattern.compile("```bash\nscripts/keystore ((?:put|get|delete|flush|compact|dump) .+)\n```")
+                .matcher(section);
         while (command.find()) {
             commands.add(command.group(1).split(" "));
         }

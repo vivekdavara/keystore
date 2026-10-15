@@ -38,15 +38,23 @@ public final class StoreDump {
                     Store.tableName(t.number()), t.fileBytes(), t.smallestSeq(), t.largestSeq());
         }
         List<Long> logs = new ArrayList<>();
+        List<Long> kept = new ArrayList<>();
         try (DirectoryStream<Path> files = Files.newDirectoryStream(dir, "*" + Store.LOG_SUFFIX)) {
             for (Path file : files) {
                 long number = Store.fileNumber(file.getFileName().toString(), Store.LOG_SUFFIX);
                 if (number >= manifest.logNumber()) {
                     logs.add(number);
+                } else if (number >= 0) {
+                    kept.add(number);
                 }
             }
         }
         Collections.sort(logs);
+        Collections.sort(kept);
+        for (long number : kept) {
+            out.printf("  %s: %d bytes, covered by the tables, kept for followers (or garbage the next open deletes)%n",
+                    Store.logName(number), Files.size(dir.resolve(Store.logName(number))));
+        }
         long seq = manifest.lastSequence();
         Verdict verdict = Verdict.CLEAN;
         for (int i = 0; i < logs.size(); i++) {

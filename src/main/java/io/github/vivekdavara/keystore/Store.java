@@ -293,10 +293,14 @@ public final class Store implements Closeable {
         // whose recovery is done (and leave the newest log's channel open). The deletions come
         // after the directory was forced (opening the newest log forces it), so the manifest they
         // follow from, perhaps renamed into place just before a crash, is on the device first.
+        List<Long> covered = new ArrayList<>();
         for (long number : logs) {
             if (number < manifest.logNumber()) {
-                deleteQuietly(real.resolve(logName(number)));
+                covered.add(number);
             }
+        }
+        for (long number : beyondRetention(real, covered, options.retainLogBytes())) {
+            deleteQuietly(real.resolve(logName(number)));
         }
         for (long number : tableFiles) {
             if (!live.contains(number)) {
@@ -564,16 +568,52 @@ public final class Store implements Closeable {
         }
     }
 
+    /** Deletes the logs before {@code number}, which the tables now cover, except those retention keeps. */
     private void deleteLogsBefore(long number) {
-        try (DirectoryStream<Path> files = Files.newDirectoryStream(dir, "*" + LOG_SUFFIX)) {
-            for (Path file : files) {
-                long n = fileNumber(file.getFileName().toString(), LOG_SUFFIX);
-                if (n >= 0 && n < number) {
-                    Files.deleteIfExists(file);
+        try {
+            List<Long> covered = new ArrayList<>();
+            try (DirectoryStream<Path> files = Files.newDirectoryStream(dir, "*" + LOG_SUFFIX)) {
+                for (Path file : files) {
+                    long n = fileNumber(file.getFileName().toString(), LOG_SUFFIX);
+                    if (n >= 0 && n < number) {
+                        covered.add(n);
+                    }
                 }
+            }
+            for (long n : beyondRetention(dir, covered, options.retainLogBytes())) {
+                Files.deleteIfExists(dir.resolve(logName(n)));
             }
         } catch (IOException ignored) {
             // Logs the manifest says are covered are deleted by the next open.
+        }
+    }
+
+    /**
+     * Of the covered logs, the ones {@link Options#retainLogBytes} doesn't keep, oldest first (the
+     * order to delete them in, so the logs left are always an unbroken run of the newest). Newest
+     * first, logs are kept until the kept ones total at least {@code retainBytes}.
+     */
+    static List<Long> beyondRetention(Path dir, List<Long> covered, long retainBytes) {
+        List<Long> newestFirst = new ArrayList<>(covered);
+        newestFirst.sort(Collections.reverseOrder());
+        List<Long> delete = new ArrayList<>();
+        long kept = 0;
+        for (long number : newestFirst) {
+            if (kept < retainBytes) {
+                kept += sizeOrZero(dir.resolve(logName(number)));
+            } else {
+                delete.add(number);
+            }
+        }
+        Collections.reverse(delete);
+        return delete;
+    }
+
+    private static long sizeOrZero(Path file) {
+        try {
+            return Files.size(file);
+        } catch (IOException e) {
+            return 0; // gone already
         }
     }
 

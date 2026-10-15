@@ -3,16 +3,20 @@ package io.github.vivekdavara.keystore.cli;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.vivekdavara.keystore.Store;
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.io.RandomAccessFile;
+import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -171,5 +175,70 @@ class MainTest {
         assertTrue(out.contains("refused: an older log must be clean"), out);
         assertEquals(1, run("get", d, "a"));
         assertTrue(err.contains("older log"), err);
+    }
+
+    @Test
+    void serveFollowAndClientReplicateEndToEnd() throws Exception {
+        ByteArrayOutputStream leaderOut = new ByteArrayOutputStream();
+        Closeable leader = Main.start(new String[] {"serve", dir.resolve("a").toString(), "0"},
+                new PrintStream(leaderOut, true, StandardCharsets.UTF_8), System.err);
+        try {
+            String leaderLine = leaderOut.toString(StandardCharsets.UTF_8);
+            assertTrue(leaderLine.startsWith("keystore: leader for "), leaderLine);
+            String leaderAddress = leaderLine.substring(leaderLine.lastIndexOf(' ') + 1).trim();
+            assertEquals(0, run("client", leaderAddress, "put", "city", "Boston"));
+            assertEquals("1\n", out);
+
+            ByteArrayOutputStream followerOut = new ByteArrayOutputStream();
+            Closeable follower = Main.start(new String[] {"follow", dir.resolve("b").toString(), "0", leaderAddress},
+                    new PrintStream(followerOut, true, StandardCharsets.UTF_8), System.err);
+            try {
+                String followerLine = followerOut.toString(StandardCharsets.UTF_8);
+                String followerAddress = followerLine.substring(followerLine.lastIndexOf(' ') + 1).trim();
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                while (run("client", followerAddress, "get", "city") != 0) {
+                    assertTrue(System.nanoTime() < deadline, "the follower never got the write: " + err);
+                    Thread.sleep(10);
+                }
+                assertEquals("Boston\n", out);
+                assertEquals(1, run("client", followerAddress, "put", "city", "Paris"));
+                assertTrue(err.contains("READONLY"), err);
+                assertEquals(0, run("client", followerAddress, "info"));
+                assertTrue(out.startsWith("role=follower seq=1 "), out);
+                assertTrue(out.contains("state=STREAMING"), out);
+                assertEquals(0, run("client", leaderAddress, "info"));
+                assertTrue(out.contains("followers=1"), out);
+            } finally {
+                follower.close();
+            }
+        } finally {
+            leader.close();
+        }
+        // Both stores are closed, and the follower's has the write.
+        assertEquals(0, run("get", dir.resolve("b").toString(), "city"));
+        assertEquals("Boston\n", out);
+    }
+
+    @Test
+    void serverCommandsCheckTheirArguments() throws Exception {
+        assertEquals(2, run("client", "nowhere", "info"));
+        assertEquals(2, run("client", "127.0.0.1:70000", "info"));
+        assertEquals(2, run("client", "127.0.0.1:1", "frob"));
+        assertEquals(2, run("client", "127.0.0.1:1", "get"));
+        assertThrows(Main.UsageException.class,
+                () -> Main.start(new String[] {"serve", dir.toString(), "x"}, System.out, System.err));
+        assertThrows(Main.UsageException.class,
+                () -> Main.start(new String[] {"follow", dir.toString(), "0", "nohostport"}, System.out, System.err));
+        assertFalse(Files.exists(dir.resolve("MANIFEST")), "a refused command creates no store");
+    }
+
+    @Test
+    void aClientWithNoServerFails() throws IOException {
+        int port;
+        try (ServerSocket probe = new ServerSocket(0)) {
+            port = probe.getLocalPort(); // free once closed
+        }
+        assertEquals(1, run("client", "127.0.0.1:" + port, "info"));
+        assertTrue(err.startsWith("keystore: "), err);
     }
 }

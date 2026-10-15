@@ -32,6 +32,8 @@ jobs:
           scripts/keystore compact target/ci-store
           if scripts/keystore get target/ci-store city; then exit 1; fi
           scripts/keystore dump target/ci-store
+      - name: Replicate between two packaged servers
+        run: scripts/replication-demo.sh
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v7

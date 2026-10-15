@@ -815,9 +815,11 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
 - **A follower crashed anywhere** (`FollowerCrashCycleTest`): the follower's store gets `TableCrashCycleTest`'s
   countdown of writes and forces, so a fault lands on a batch's append, a flush's table, the manifest or a directory
   force. Each image is recovered and must be exactly the leader's state at the image's own sequence number, with
-  nothing the follower acknowledged missing; then it follows on. Two seeds of 40 cycles: 56 crashes, faults on every
-  kind of step; whole records of a batch whose append failed partway are recovered too (98 of them), which is still a
-  prefix.
+  nothing the follower acknowledged missing; then it follows on. Seeds of 40 cycles run until a fault has landed on
+  every kind of step (a write or force of the log, a table, the manifest, the directory), at least 2 and at most 8:
+  two were enough here (56 crashes); in CI, once, they weren't (no manifest write was hit), which is why it runs on.
+  Whole records of a batch whose append failed partway are recovered too (98 of them in those two seeds), which is
+  still a prefix.
 - **A scripted leader** (`FollowerStreamTest`) sends a gap, a repeat, a damaged record, a burst cut short, records in
   the same burst as `ERR INTERNAL` and `ERR BEHIND`, and lines that aren't a stream: the follower applies exactly the
   records that passed their checks, never one that didn't, and asks again from its store's position.

@@ -84,16 +84,33 @@ class FollowerCrashCycleTest {
         }
     }
 
+    /** The kinds of step a fault should land on: a write or a force of each. */
+    private static final String[] STEPS = {"log", "table", "manifest", "directory"};
+
     @Test
     @Timeout(value = 180, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     void aCrashedFollowerRecoversToAPrefixOfItsLeadersHistory() throws Exception {
         Map<String, Integer> faults = new TreeMap<>();
-        for (long seed = 1; seed <= 2; seed++) {
-            cycles(seed, faults);
+        // Which call a fault lands on depends on how batches form, and that depends on timing: in CI
+        // two seeds once put none on a manifest write. So seeds run until a fault has landed on every
+        // kind of step, at least 2 of them and at most 8.
+        long seed = 0;
+        while (seed < 2 || (uncovered(faults) != null && seed < 8)) {
+            cycles(++seed, faults);
         }
-        for (String step : new String[] {"log write", "table write", "manifest write", "directory force"}) {
-            assertTrue(faults.containsKey(step), "no fault landed on a " + step + ": " + faults);
+        assertTrue(uncovered(faults) == null, "no fault landed on a " + uncovered(faults) + " step: " + faults);
+    }
+
+    /** A kind of step no fault has landed on yet, or null. */
+    private static String uncovered(Map<String, Integer> faults) {
+        for (String step : STEPS) {
+            synchronized (faults) {
+                if (!faults.containsKey(step + " write") && !faults.containsKey(step + " force")) {
+                    return step;
+                }
+            }
         }
+        return null;
     }
 
     private void cycles(long seed, Map<String, Integer> faults) throws Exception {

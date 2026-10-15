@@ -188,7 +188,7 @@ CI runs it on Linux and macOS.
 | A tail reads every record in order across logs, follows a writer through 20,000 writes, flushes and merges, reads on through a deleted log, says `BEHIND` when a log is gone, and never returns a damaged record | `LogTailTest` |
 | A follower gets every write live, catches up late, after its own restart, after a broken connection and after the leader's restart; `BEHIND`, `AHEAD` and `DIVERGED` stop it; a silent follower is dropped; every key compared | `ReplicationTest` |
 | `keystore serve`, `follow` and `client` end to end | `MainTest`, `scripts/replication-demo.sh` |
-| A follower crashed at any write or force (80 cycles, 56 crashes) recovers to exactly its leader's state at its own sequence number, then follows on | `FollowerCrashCycleTest` |
+| A follower crashed at any write or force (40 cycles a seed until every kind of step had a fault; 56 crashes in two seeds here) recovers to exactly its leader's state at its own sequence number, then follows on | `FollowerCrashCycleTest` |
 | A scripted leader sends gaps, repeats, damaged records and junk: the follower applies only what passed its checks and asks again from its position | `FollowerStreamTest` |
 | The review's three bugs, as tests that failed before the fixes | `review/` |
 

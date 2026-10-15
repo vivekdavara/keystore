@@ -506,6 +506,19 @@ public final class Store implements Closeable {
         }
     }
 
+    /**
+     * A reader of this store's logs from sequence number {@code from} on, which then follows new
+     * writes: what a leader ships to followers (see {@link LogTail}). Close it when done.
+     */
+    public LogTail tail(long from) {
+        ensureOpen();
+        return new LogTail(this, from);
+    }
+
+    boolean isClosed() {
+        return closed;
+    }
+
     /** Threads in {@link #awaitSequence} now, for tests. */
     int sequenceWaiters() {
         return sequenceWaiters.get();

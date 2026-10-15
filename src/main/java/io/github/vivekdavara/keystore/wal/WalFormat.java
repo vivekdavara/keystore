@@ -29,10 +29,10 @@ public final class WalFormat {
     public static final int HEADER_BYTES = 8;
 
     /** The smallest payload: a delete with a 1-byte key. */
-    static final int MIN_PAYLOAD = 8 + 1 + 4 + 1;
+    public static final int MIN_PAYLOAD = 8 + 1 + 4 + 1;
 
     /** The largest payload: a put with the largest key and value. */
-    static final int MAX_PAYLOAD = 8 + 1 + 4 + MAX_KEY_BYTES + 4 + MAX_VALUE_BYTES;
+    public static final int MAX_PAYLOAD = 8 + 1 + 4 + MAX_KEY_BYTES + 4 + MAX_VALUE_BYTES;
 
     private static final int SEQ_AT = HEADER_BYTES;
     private static final int OP_AT = SEQ_AT + 8;

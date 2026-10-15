@@ -201,6 +201,38 @@ These are plain wall-clock timings, not JMH (that's day 4): `scripts/bench.sh` p
 after a warm-up run in the same JVM, and each figure below is the median of 5 runs. `Bench` is
 `java -cp target/classes:target/test-classes io.github.vivekdavara.keystore.bench.Bench`.
 
+### Day 3: the server and replication
+
+Measured on an Apple M3 (macOS 26.6.2, the internal SSD, APFS) with Homebrew OpenJDK 21.0.12, **on power**
+(charging, Low Power Mode off), with nothing else running: `scripts/bench.sh 5 3` at `c239820`, 17:34 to 17:41.
+Everything is over loopback TCP on one machine; keys are 16 bytes and values 100; the data is synthetic.
+
+| What | Median of 5 (range) | Command |
+|---|---|---|
+| Puts, 1 connection, one request at a time, to a leader under `NEVER` | 35,096/s; p50 26.6 µs, p99 41.6 µs (34,579–35,241/s) | `Bench server 1 100000 100` |
+| Gets, 1 connection | 38,633/s; p50 25.5 µs, p99 36.9 µs (38,422–38,798/s) | the same run |
+| Puts, 4 connections | 68,199/s; p50 50.4 µs, p99 108.6 µs (66,277–69,374/s) | `Bench server 4 100000 100` |
+| Gets, 4 connections | 86,232/s; p50 43.0 µs, p99 92.4 µs (84,141–87,669/s) | the same run |
+| Puts, 16 connections | 68,795/s; p50 216.9 µs, p99 373.9 µs (62,333–73,623/s) | `Bench server 16 100000 100` |
+| Gets, 16 connections | 107,105/s; p50 142.3 µs, p99 289.3 µs (104,607–108,756/s) | the same run |
+| A new follower catching up on 1,000,000 writes (141 MB of log), its store under `NEVER` | 4,715 ms: 212,089 records/s, 30 MB/s (187,229–224,721/s) | `Bench catchup 1000000 100 NEVER` |
+| The same, the follower's store under `EVERY_WRITE` (one force a batch) | 6,549 ms: 152,697 records/s, 22 MB/s (150,124–154,149/s) | `Bench catchup 1000000 100 EVERY_WRITE` |
+| One write's replication lag (from the leader's `put` returning to the follower having applied it), follower under `NEVER` | p50 28.0 µs, p99 73.3 µs, slowest 1.4 ms (p50 27.8–28.1 µs) | `Bench lag 10000 100 NEVER` |
+| The same, follower under `EVERY_WRITE` | p50 2,959 µs, p99 4,201 µs, slowest 11.0 ms (p50 2,895–2,964 µs) | `Bench lag 1000 100 EVERY_WRITE` |
+| For comparison, one 128-byte append and force in C (`target/fsync_cost target 1000`) | `F_FULLFSYNC` p50 2,994 µs; `fsync` p50 27 µs | `scripts/bench.sh` |
+
+- **One connection's round trip is about 26 µs**, of which the store's own put is about 2 µs (day 2's p50 under
+  `NEVER`); the rest is the client, loopback TCP and the server's thread.
+- **Puts stop scaling at 4 connections** (68,199/s at 4, 68,795/s at 16): writes are serialised by the store's write
+  lock, so more connections only queue (the p50 goes from 50 µs to 217 µs). Gets, which take no lock, keep scaling,
+  to 107,105/s on 16 connections.
+- **Catching up batches itself.** Every one of the 977 batches was full (1,024 records): a follower that is behind
+  always has more waiting. That is what makes a forcing follower practical: under `EVERY_WRITE` it applied 152,697
+  writes a second, where day 1's store forcing each write managed 361. The forces added 1.8 s, 1.9 ms a batch, less
+  than a device flush (3.0 ms), probably because the leader goes on sending while the follower waits on its force.
+- **Live replication costs about 28 µs a write** when the follower doesn't force, about one loopback round trip;
+  when it forces, the lag is one device flush (2,959 µs against `F_FULLFSYNC`'s 2,994 µs).
+
 ### Day 2: flushes, merges, and reads from tables
 
 Measured on an Apple M3 (macOS 26.6.2, the internal SSD, APFS) with Homebrew OpenJDK 21.0.12, **on battery** (Low

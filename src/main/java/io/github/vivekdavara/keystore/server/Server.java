@@ -92,6 +92,9 @@ public final class Server implements Closeable {
 
     private static final int BUFFER_BYTES = 64 * 1024;
 
+    /** The longest a stream waits for a write before it looks at whether it should stop. */
+    private static final long WAIT_SLICE_NANOS = TimeUnit.MILLISECONDS.toNanos(50);
+
     private final Store store;
     private final Role role;
     private final Config config;
@@ -354,20 +357,30 @@ public final class Server implements Closeable {
         Thread acks = Thread.ofVirtual().name("keystore-acks").start(() -> readAcks(socket, in, follower));
         try (tail) {
             long heartbeat = config.heartbeat().toNanos();
-            while (!closing) {
+            // A wait for a write wakes only for a write or the store's close: not for the server
+            // closing, nor for the ACK reader closing the socket. So waits are cut into slices, and
+            // the stream looks between them (found by review: close() waited out an idle stream's
+            // whole heartbeat, then returned with it still running).
+            long slice = Math.min(heartbeat, WAIT_SLICE_NANOS);
+            long lastSent = System.nanoTime();
+            while (!closing && !socket.isClosed()) {
                 byte[] record = nextRecord(tail, 0);
                 if (record == null) {
                     out.flush(); // caught up: send what's buffered before waiting
-                    record = nextRecord(tail, heartbeat);
+                    record = nextRecord(tail, slice);
                 }
                 if (record == null) {
-                    Protocol.writeLine(out, "HEARTBEAT " + store.lastSequence());
-                    out.flush();
+                    if (System.nanoTime() - lastSent >= heartbeat) {
+                        Protocol.writeLine(out, "HEARTBEAT " + store.lastSequence());
+                        out.flush();
+                        lastSent = System.nanoTime();
+                    }
                     continue;
                 }
                 Protocol.writeLine(out, "REC " + record.length);
                 out.write(record);
                 follower.sent = tail.nextSequence() - 1;
+                lastSent = System.nanoTime();
             }
         } catch (StreamEnd end) {
             Protocol.writeLine(out, end.line);

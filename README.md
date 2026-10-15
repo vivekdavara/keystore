@@ -186,7 +186,7 @@ CI runs it on Linux and macOS.
 | `replicate` takes the leader's numbers or nothing; one force for a batch; `awaitSequence` wakes on a write and on close | `ReplicateTest` |
 | Retention keeps an unbroken run of the newest covered logs, across flushes and reopens | `LogRetentionTest` |
 | A tail reads every record in order across logs, follows a writer through 20,000 writes, flushes and merges, reads on through a deleted log, says `BEHIND` when a log is gone, and never returns a damaged record | `LogTailTest` |
-| A follower gets every write live, catches up late, after its own restart, after a broken connection and after the leader's restart; `BEHIND` and `AHEAD` stop it; a silent follower is dropped; every key compared | `ReplicationTest` |
+| A follower gets every write live, catches up late, after its own restart, after a broken connection and after the leader's restart; `BEHIND`, `AHEAD` and `DIVERGED` stop it; a silent follower is dropped; every key compared | `ReplicationTest` |
 | `keystore serve`, `follow` and `client` end to end | `MainTest`, `scripts/replication-demo.sh` |
 | A follower crashed at any write or force (80 cycles, 56 crashes) recovers to exactly its leader's state at its own sequence number, then follows on | `FollowerCrashCycleTest` |
 | A scripted leader sends gaps, repeats, damaged records and junk: the follower applies only what passed its checks and asks again from its position | `FollowerStreamTest` |
@@ -452,6 +452,9 @@ leader's history) and `FollowerStreamTest` (a scripted leader that sends gaps, r
   a follower.
 - **Ship only acknowledged writes.** A tail never reads past `lastSequence()`, so it never sees a write in progress,
   and under `EVERY_WRITE` a follower never has a write the leader could lose in a crash.
+- **Check where the histories join.** `SYNC` carries the stored checksum of the follower's last write, and the
+  leader refuses (`DIVERGED`) if its own write there differs: Raft's previous-entry check, with the record's
+  checksum standing in for the term.
 - **A follower's position is its store's `lastSequence()`.** No separate position file: after a crash it asks for
   whatever comes after what its store recovered.
 - **Group commit on the follower.** Whatever has arrived is applied in one batch, with one force, so a follower that
@@ -476,8 +479,9 @@ leader's history) and `FollowerStreamTest` (a scripted leader that sends gaps, r
 - Replication is asynchronous, with no failover: a write the leader acknowledged may be on no follower yet, and a
   follower's reads can be stale by its lag (`info` shows it).
 - A follower that falls further behind than the leader's kept logs stops as `BEHIND` until day 4's snapshots.
-- A leader under `NEVER` that loses acknowledged writes in a crash and then takes new ones can leave a follower with
-  a different history at those sequence numbers, undetected (`AHEAD` catches it only if the follower asks first).
+- A leader under `NEVER` that loses acknowledged writes in a crash and then takes new ones is caught by `SYNC`'s
+  checksum of the follower's last write (`DIVERGED`), but only when the follower still knows that checksum (not
+  after a restart with every write in its tables) and the leader's log still holds that write.
 - No authentication or TLS; the server listens on the loopback address.
 
 DESIGN.md's "Limitations" has the full list.

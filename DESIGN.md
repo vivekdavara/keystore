@@ -567,12 +567,12 @@ text protocol: keys and values are any bytes, nothing is escaped, and nothing is
 | `PUT klen vlen` `\n` key value | `OK seq`, the write's sequence number |
 | `DEL klen` `\n` key | `OK seq` |
 | `INFO` | `INFO role=leader seq=… connections=… followers=…` (a follower adds its state, its leader's position and its lag) |
-| `SYNC from` | the replication stream (next section); leaders only |
+| `SYNC from [checksum]` | the replication stream (next section); leaders only. The checksum is the stored checksum of the follower's write `from - 1`, which the leader checks against its own |
 | anything | `ERR CODE text` |
 
 Error codes: `PROTOCOL` (the request broke the rules; the connection closes), `READONLY` (a write or `SYNC` sent to
 a follower), `FULL` (the log is full; nothing was written and the store goes on), `FAILED` (the store's writes
-failed; it takes none until reopened), `BUSY` (too many connections), `BEHIND` and `AHEAD` (replication), `INTERNAL`
+failed; it takes none until reopened), `BUSY` (too many connections), `BEHIND`, `AHEAD` and `DIVERGED` (replication), `INTERNAL`
 (anything else: an I/O error, a closed store).
 
 - **Numbers are strict**: decimal digits, no sign, no leading zero, at most 18 digits. Words are separated by one
@@ -683,6 +683,14 @@ at a time and looks at both between waits, sending a heartbeat once a whole hear
 Without the slices (the review), `Server.close()` waited out an idle stream's heartbeat, 5 s with a 30-second one,
 and returned with the stream still running.
 
+**Histories are checked where the stream joins.** A follower sends `SYNC from checksum`, the stored checksum of its
+write `from - 1` (`Store.lastChecksum()`: kept for the last write, and recovered from the last record a log
+replays). The leader reads its own write `from - 1` with a tail and compares; if they differ, it refuses with
+`ERR DIVERGED`, as Raft checks the term of the entry before the ones it sends. A checksum covers the sequence
+number, the key and the value, so equal checksums mean the same write but for a CRC collision. This catches a
+leader under `NEVER` that lost writes in a crash a follower already had and then took others under the same
+numbers, which `AHEAD` misses once the leader has written past the follower.
+
 **Replication is asynchronous.** The leader acknowledges a write when its own log has it; a follower may not have
 it yet, and a follower's reads may be stale by its lag. There is no failover: a follower never becomes a leader.
 
@@ -692,6 +700,7 @@ it yet, and a follower's reads may be stale by its lag. There is no failover: a 
 | The follower crashes | Its store recovers like any store; it asks from its recovered `lastSequence()+1` |
 | The record it needs is in a log the leader no longer has | `ERR BEHIND oldest`: stops in state `BEHIND` (it needs a copy of the tables) |
 | It has writes the leader doesn't (a leader that lost acknowledged writes under `NEVER`, or another leader's follower) | `ERR AHEAD last`: stops in state `AHEAD`; streaming would mix two histories |
+| Its last write isn't the leader's write with that number (the leader lost writes under `NEVER`, then took others) | `ERR DIVERGED seq`: stops in state `DIVERGED`, with nothing of the other history applied |
 | A record fails its checksum or isn't the next sequence number | Drops the connection and reconnects (the leader ends a stream itself if its own log is damaged) |
 | Its store fails, or refuses a batch | Stops in state `FAILED`; the store needs reopening |
 | It goes silent | The leader closes the stream after ten heartbeats |
@@ -795,7 +804,9 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
   error, never data; a closed store's tail fails instead of spinning.
 - **Replication** (`ReplicationTest`): a follower getting every write live; one that starts late and catches up
   from a leader's logs and tables; one restarted while the leader took 2,000 more writes; a broken connection
-  resumed; a leader restarted from its directory; `BEHIND` and `AHEAD`; reads and refused writes on a follower's
+  resumed; a leader restarted from its directory; `BEHIND`, `AHEAD`, and `DIVERGED` (a second leader on the same
+  port with writes 6 to 12 different: the follower stops at 10, and without the check it streamed on to 12, a mixed
+  history); a raw `SYNC` with a wrong and a right checksum; reads and refused writes on a follower's
   server, and the leader's view of its ACKs; 6 clients writing while a follower that forces (`EVERY_WRITE`) keeps
   up; a follower that never ACKs dropped after ten heartbeats; the raw stream from `SYNC 8` and `ERR AHEAD`. Each
   compares every key of the two stores and their sequence numbers.
@@ -870,12 +881,13 @@ Day 3's:
 - **Replication is asynchronous, with no failover.** A write the leader acknowledged can be on no follower yet; if
   the leader's disk is lost, so is the write. Nothing promotes a follower. Semi-synchronous replication (waiting for
   one follower's ACK before acknowledging) would build on the ACKs that exist.
-- **Divergence is caught only when the follower is ahead.** A leader under `NEVER` can lose acknowledged writes in a
-  crash, and a follower may already have them. If the follower asks before the leader has written past it, `AHEAD`
-  stops it; if the leader has since taken new writes under the same sequence numbers, the follower carries on from
-  a history that differs at those numbers, and nothing notices. Checking the checksum of the record before `from`
-  (as Raft checks the previous entry's term) would catch it; under `EVERY_WRITE` it can't happen, since a leader
-  never ships a write it could lose.
+- **Divergence is caught at the follower's last write, when both sides still know it.** A leader under `NEVER` can
+  lose acknowledged writes in a crash that a follower already has, then take others under the same numbers. `SYNC`
+  carries the stored checksum of the follower's last write and the leader compares it with its own (`DIVERGED`);
+  but a follower whose writes are all in its tables (restarted after a flush) doesn't know that checksum, and a
+  leader whose log no longer holds that write can't compare, and then nothing is checked. A divergence further back
+  than the last write isn't looked for either (Raft would walk back to the last matching entry). Under `EVERY_WRITE`
+  none of this can happen, since a leader never ships a write it could lose.
 - **A follower `BEHIND` stops** until someone gives it a copy of the leader's tables (day 4's snapshots).
 - **No authentication or TLS**, and the server listens on the loopback address only; `SYNC` hands the whole store to
   anyone who can connect.

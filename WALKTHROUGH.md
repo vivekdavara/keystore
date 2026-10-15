@@ -424,15 +424,19 @@ appending it fails it at once.
 **Can a follower end up with different data than the leader?**
 Under `EVERY_WRITE` on the leader, no: a follower only gets acknowledged, forced records, applied in order with the
 same numbers. Under `NEVER`, a leader crash can lose acknowledged writes a follower already has. If the follower
-reconnects first, it is ahead of the leader and gets `ERR AHEAD` (it stops). If the leader has already taken new
-writes under those numbers, the follower carries on with a different history at them, and nothing notices; the fix
-is to check the checksum of the record before `from` in `SYNC`, as Raft checks the previous entry's term. It's in
-DESIGN.md's limitations.
+reconnects before the leader has written past it, it is ahead and gets `ERR AHEAD`. If the leader has already taken
+new writes under those numbers, `SYNC` catches it: the follower sends the stored checksum of its last write (`SYNC
+11 checksum`), the leader reads its own write 10 and compares, and a mismatch is `ERR DIVERGED 10`. It's Raft's
+check of the previous entry's term, with the record's CRC32C standing in for the term
+(`ReplicationTest.aFollowerWhoseLeaderCameBackWithADifferentHistoryStops`: without it, the follower streamed on to 12
+with a mixed history). The gaps: a follower that restarted with every write in its tables doesn't know its last
+checksum, and a leader whose log no longer holds that write can't compare; then nothing is checked.
 
 ## What's next
 
 **What would you build next?**
 Crash tests with a killed process, on a leader and a follower; snapshots, which also give a `BEHIND` follower a copy
 of the tables to start from; JMH benchmarks; and moving flushes and merges to a background thread with group commit
-(day 4). For replication: the previous-record check in `SYNC`, and semi-synchronous writes. For the tables
+(day 4). For replication: keeping the last write's checksum across a follower's restart (in the manifest), walking
+back to the last matching write after a divergence, and semi-synchronous writes. For the tables
 themselves: a block cache, prefix compression within blocks, and leveled compaction to compare against size-tiered.

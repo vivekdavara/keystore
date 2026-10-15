@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.vivekdavara.keystore.wal.LogFullException;
+import io.github.vivekdavara.keystore.wal.WalFormat;
 import io.github.vivekdavara.keystore.wal.WalRecord;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
@@ -150,6 +151,35 @@ class ReplicateTest {
             assertEquals(0, store.logSize());
             store.replicate(records(1, 10));
             assertEquals(10, store.lastSequence());
+        }
+    }
+
+    private static long checksum(WalRecord record) {
+        return WalFormat.storedChecksum(WalFormat.encode(record));
+    }
+
+    @Test
+    void lastChecksumIsTheLastRecordsStoredChecksum() throws IOException {
+        Options options = Options.defaults().withSync(SyncPolicy.NEVER);
+        List<WalRecord> batch = records(2, 3);
+        try (Store store = Store.open(dir, options)) {
+            assertEquals(-1, store.lastChecksum(), "a new store has none");
+            store.put(utf8("a"), utf8("1"));
+            assertEquals(checksum(WalRecord.put(1, utf8("a"), utf8("1"))), store.lastChecksum());
+            store.replicate(batch);
+            assertEquals(checksum(batch.get(2)), store.lastChecksum());
+            assertTrue(store.lastChecksum() >= 0 && store.lastChecksum() <= 0xffffffffL);
+        }
+        try (Store store = Store.open(dir, options)) {
+            assertEquals(4, store.lastSequence());
+            assertEquals(checksum(batch.get(2)), store.lastChecksum(), "recovered from the log");
+            store.flush();
+            assertEquals(checksum(batch.get(2)), store.lastChecksum(), "a flush doesn't change it");
+        }
+        try (Store store = Store.open(dir, options)) {
+            assertEquals(-1, store.lastChecksum(), "every write is in the tables: unknown");
+            store.delete(utf8("a"));
+            assertEquals(checksum(WalRecord.delete(5, utf8("a"))), store.lastChecksum());
         }
     }
 

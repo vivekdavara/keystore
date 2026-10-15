@@ -146,8 +146,10 @@ public final class WriteAheadLog implements Closeable {
      * not yet on the device: call {@link #sync} for that. After an exception, part of the record may
      * have been written; the caller must stop appending (the store does). Call
      * {@link #ensureRoomFor} first: this checks the limit too, but as a bug, after nothing is written.
+     *
+     * @return the checksum the record was stored with ({@link WalFormat#storedChecksum})
      */
-    public void append(WalRecord record) throws IOException {
+    public long append(WalRecord record) throws IOException {
         if (size + WalFormat.encodedSize(record) > maxBytes) {
             throw new IllegalStateException("append without room; call ensureRoomFor first");
         }
@@ -157,6 +159,7 @@ public final class WriteAheadLog implements Closeable {
             channel.write(bytes);
         }
         size += length;
+        return WalFormat.storedChecksum(bytes);
     }
 
     /** Forces everything appended so far to the device. */

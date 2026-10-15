@@ -98,6 +98,21 @@ public final class WalFormat {
     }
 
     /**
+     * The checksum stored in an encoded record (from {@link #encode}, or a record's bytes as the log
+     * holds them), as an unsigned 32-bit number. It covers the sequence number, the key and the value,
+     * so two records with the same sequence number and checksum are, but for a CRC collision, the same
+     * write: replication uses it to check that a follower's history matches its leader's.
+     */
+    public static long storedChecksum(ByteBuffer record) {
+        return record.getInt(4) & 0xffffffffL;
+    }
+
+    /** {@link #storedChecksum(ByteBuffer)} of a record's bytes. */
+    public static long storedChecksum(byte[] record) {
+        return intAt(record, 4) & 0xffffffffL;
+    }
+
+    /**
      * Checks a write against the limits.
      *
      * @param value null for a delete

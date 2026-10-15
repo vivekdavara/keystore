@@ -40,6 +40,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 
 /**
  * A key-value store in one directory: a write-ahead log, a memtable, and tables (LSM).
@@ -91,6 +92,11 @@ public final class Store implements Closeable {
      */
     private final AtomicLong lastSeq;
     /**
+     * The stored checksum of the record lastSeq names, or -1 if unknown (see {@link #lastChecksum}).
+     * Written under writeLock, just before lastSeq.
+     */
+    private volatile long lastChecksum;
+    /**
      * For {@link #awaitSequence}: signalled when lastSeq advances or the store closes, and only if
      * someone waits, so writes nobody follows don't take a second lock. A ReentrantLock, not a
      * monitor: in Java 21 a virtual thread blocked in Object.wait pins its carrier thread.
@@ -120,7 +126,7 @@ public final class Store implements Closeable {
     private Store(
             Path dir, Object identity, Options options, BiFunction<Path, FileChannel, FileChannel> wrap,
             FileChannel lockChannel, FileLock lock, WriteAheadLog log, Manifest manifest, long nextFileNumber,
-            Version current, Recovery recovery) {
+            Version current, Recovery recovery, long lastChecksum) {
         this.dir = dir;
         this.identity = identity;
         this.options = options;
@@ -133,6 +139,7 @@ public final class Store implements Closeable {
         this.current = current;
         this.recovery = recovery;
         this.lastSeq = new AtomicLong(recovery.lastSeq());
+        this.lastChecksum = lastChecksum;
     }
 
     /** A log's file name: its number, six digits or more. */
@@ -286,16 +293,24 @@ public final class Store implements Closeable {
         MemTable memtable = new MemTable();
         long seq = manifest.lastSequence();
         long records = 0;
+        WalRecord[] lastReplayed = new WalRecord[1];
+        Consumer<WalRecord> replayOne = r -> {
+            apply(memtable, r);
+            lastReplayed[0] = r;
+        };
         for (int i = 0; i < replay.size() - 1; i++) {
             Recovery older = WriteAheadLog.replayClosed(
-                    real.resolve(logName(replay.get(i))), seq + 1, r -> apply(memtable, r), wrap);
+                    real.resolve(logName(replay.get(i))), seq + 1, replayOne, wrap);
             seq = older.lastSeq();
             records += older.records();
         }
         WriteAheadLog.Opened newest = WriteAheadLog.open(
                 real.resolve(logName(replay.get(replay.size() - 1))), seq + 1, options.recovery(),
-                r -> apply(memtable, r), options.maxLogBytes(), wrap);
+                replayOne, options.maxLogBytes(), wrap);
         Recovery last = newest.recovery();
+        // The checksum of the last write, if a log still holds it; not if the tables hold every write.
+        long lastChecksum = lastReplayed[0] != null && lastReplayed[0].seq() == last.lastSeq()
+                ? WalFormat.storedChecksum(WalFormat.encode(lastReplayed[0])) : -1;
         Recovery recovery = new Recovery(last.outcome(), records + last.records(), last.lastSeq(),
                 last.validBytes(), last.droppedBytes(), last.detail());
 
@@ -326,7 +341,8 @@ public final class Store implements Closeable {
         }
         tables.clear();
         long next = Math.max(manifest.nextFileNumber(), highest + 1);
-        return new Store(real, identity, options, wrap, lockChannel, lock, newest.log(), manifest, next, version, recovery);
+        return new Store(real, identity, options, wrap, lockChannel, lock, newest.log(), manifest, next, version, recovery,
+                lastChecksum);
     }
 
     /**
@@ -470,9 +486,10 @@ public final class Store implements Closeable {
     /** Appends records, forces them under EVERY_WRITE, applies them, then publishes them. Under writeLock. */
     private void appendAndApply(List<WalRecord> records) throws IOException {
         boolean flushing = false;
+        long checksum = -1;
         try {
             for (WalRecord record : records) {
-                log.append(record);
+                checksum = log.append(record);
             }
             if (options.sync() == SyncPolicy.EVERY_WRITE) {
                 flushing = true;
@@ -492,6 +509,7 @@ public final class Store implements Closeable {
             throw e;
         }
         // Only now: lastSequence() never names a write that reads can't see.
+        lastChecksum = checksum;
         lastSeq.set(records.get(records.size() - 1).seq());
         signalSequence();
     }
@@ -927,6 +945,18 @@ public final class Store implements Closeable {
      */
     public long lastSequence() {
         return lastSeq.get();
+    }
+
+    /**
+     * The checksum the record {@link #lastSequence()} names was stored with, as an unsigned 32-bit
+     * number ({@link WalFormat#storedChecksum}), or -1 if this store doesn't know it: a new store, or
+     * one opened with every write in its tables. With the sequence number, it identifies the last
+     * write well enough for a follower to show its leader that their histories match. Consistent
+     * with {@link #lastSequence()} when no write runs at the same time (a follower reads both on the
+     * thread that makes its writes).
+     */
+    public long lastChecksum() {
+        return lastChecksum;
     }
 
     /** The store's directory (its real path). */

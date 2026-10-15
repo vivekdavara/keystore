@@ -109,6 +109,11 @@ public final class LogTail implements Closeable {
             peek.clear();
             int n = readFully(peek, position);
             if (n == 0) {
+                if (position > channel.size()) {
+                    // Only a skip moves past bytes unread, by a length it didn't check: a damaged
+                    // length ran it past the end. Damage, not the end of the log (from the review).
+                    throw damaged("a record runs past the end of the log");
+                }
                 // The end of this log, and the record isn't in it: this log is finished (only the
                 // store's newest log is written to, and the record is acknowledged), so the record
                 // is in a newer one.
@@ -161,7 +166,13 @@ public final class LogTail implements Closeable {
                 } catch (NoSuchFileException e) {
                     continue; // deleted since the listing
                 }
-                long first = firstSequence(c);
+                long first;
+                try {
+                    first = firstSequence(c);
+                } catch (IOException | RuntimeException e) {
+                    c.close(); // found by review: only the chosen channel was closed on the way out
+                    throw e;
+                }
                 if (first < 0) {
                     c.close(); // empty: a new log, or one whose first write is in progress
                     continue;

@@ -3,6 +3,7 @@ package io.github.vivekdavara.keystore;
 import static io.github.vivekdavara.keystore.Bytes.utf8;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -179,6 +180,62 @@ class LogTailTest {
             });
             assertTrue(e.getMessage().contains("damaged"), e.getMessage());
         }
+    }
+
+    @Test
+    void aSkipThatRunsPastTheEndIsDamageNotBehind() throws IOException {
+        try (Store store = Store.open(dir, options(1L << 30))) {
+            write(store, 1, 1_000);
+        }
+        Path first = dir.resolve(Store.logName(logs().get(0))); // covered by tables: recovery doesn't read it
+        try (RandomAccessFile file = new RandomAccessFile(first.toFile(), "rw")) {
+            file.seek(offsetOf(first, 3));
+            file.writeInt(WalFormat.MAX_PAYLOAD - 10); // a plausible length, far past the end of the log
+        }
+        try (Store store = Store.open(dir, options(1L << 30)); LogTail tail = store.tail(10)) {
+            IOException e = assertThrows(IOException.class, tail::poll); // skips 1, 2 and 3 by their headers
+            assertFalse(e instanceof LogTail.BehindException, "from the review: it said BEHIND: " + e);
+            assertTrue(e.getMessage().contains("past the end"), e.getMessage());
+        }
+    }
+
+    @Test
+    void aRecordMissingFromAKeptLogIsDamage() throws IOException {
+        try (Store store = Store.open(dir, options(1L << 30))) {
+            write(store, 1, 1_000);
+        }
+        Path first = dir.resolve(Store.logName(logs().get(0)));
+        byte[] log = Files.readAllBytes(first);
+        int from = (int) offsetOf(first, 5);
+        int to = (int) offsetOf(first, 6);
+        byte[] cut = new byte[log.length - (to - from)];
+        System.arraycopy(log, 0, cut, 0, from);
+        System.arraycopy(log, to, cut, from, log.length - to); // every record left has a good checksum
+        Files.write(first, cut);
+        try (Store store = Store.open(dir, options(1L << 30)); LogTail tail = store.tail(1)) {
+            for (long seq = 1; seq <= 4; seq++) {
+                assertEquals(expected(seq), decode(tail.poll()));
+            }
+            IOException e = assertThrows(IOException.class, tail::poll);
+            assertTrue(e.getMessage().contains("record 6 where 5 should be"), e.getMessage());
+        }
+    }
+
+    /** Where the record with sequence number {@code seq} starts in a log, found by walking the headers. */
+    private static long offsetOf(Path log, long seq) throws IOException {
+        try (RandomAccessFile file = new RandomAccessFile(log.toFile(), "r")) {
+            long offset = 0;
+            while (offset < file.length()) {
+                file.seek(offset);
+                int length = file.readInt();
+                file.readInt(); // the checksum
+                if (file.readLong() == seq) {
+                    return offset;
+                }
+                offset += WalFormat.HEADER_BYTES + length;
+            }
+        }
+        throw new AssertionError("no record " + seq + " in " + log);
     }
 
     @Test

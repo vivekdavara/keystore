@@ -232,8 +232,9 @@ synthetic.
   lock, and with several connections waiting, each write hands the lock to a parked thread, so more connections only
   queue (the p50 goes from 50 µs to 217 µs). It isn't the lock's capacity: one pipelined connection, which never
   contends for it, puts 147,534 a second. Gets, which take no lock, keep scaling, to 107,105/s on 16 connections.
-- **Pipelining pays because the server flushes only when no request is waiting**: 16 requests in flight give 4.2
-  times the puts and 5.4 times the gets of one at a time, answered in a few writes rather than one each.
+- **Pipelining pays**: 16 requests in flight give 4.2 times the puts and 5.4 times the gets of one at a time. The
+  client stops waiting a round trip for each request, and the server, which flushes only when no request is
+  waiting, can answer several with one write.
 - **Catching up batches itself.** Every one of the 977 batches was full (1,024 records): a follower that is behind
   always has more waiting. That is what makes a forcing follower practical: under `EVERY_WRITE` it applied 152,697
   writes a second, where day 1's store forcing each write managed 361. The forces added 1.8 s, 1.9 ms a batch, less

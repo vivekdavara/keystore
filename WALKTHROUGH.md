@@ -10,8 +10,9 @@ replication ("The server and replication", below).
 DESIGN.md "Tables", "The flush", "Versions" and "Compaction" → `sstable/TableFormat` (the format at the top) →
 `sstable/Table.get` → `Store.flushMemtable`, `Store.get`, `Store.merge` → `Version` → `TableCrashCycleTest` and
 `StoreConcurrencyTest`. For day 3: DESIGN.md "The server" and "Replication" → `server/Protocol` (the table at the
-top) → `server/Server.serve`, `answer`, `ship` → `LogTail.read` and `open` → `server/Follower.run` and `stream` →
-`Store.replicate` and `awaitSequence` → `ReplicationTest`.
+top) → `server/Server.serve`, `answer`, `ship`, `checkHistory` → `LogTail.read` and `open` → `server/Follower.run`,
+`stream` and `follow` → `Store.replicate`, `appendAndApply` and `awaitSequence` → `ReplicationTest`,
+`FollowerStreamTest` and `FollowerCrashCycleTest`.
 
 ## The big picture
 

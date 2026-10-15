@@ -223,6 +223,60 @@ class ReplicationTest {
     }
 
     @Test
+    void aFollowerWhoseLeaderCameBackWithADifferentHistoryStops() throws Exception {
+        // A leader under NEVER that lost writes 6 to 10 in a crash, then took others under the same
+        // numbers: the follower got the first 6 to 10. Played here by a second leader on the same port.
+        Store first = Store.open(dir.resolve("leader-1"), leaderOptions());
+        Server firstServer = Server.leader(first, FAST);
+        int port = firstServer.port();
+        for (int i = 1; i <= 10; i++) {
+            first.put(utf8("k" + i), utf8("first-" + i));
+        }
+        Store followerStore = open("follower", followerOptions());
+        Follower follower = track(Follower.start(followerStore, Follower.Config.of(firstServer.address())
+                .withTimeout(Duration.ofSeconds(5)).withMaxBackoff(Duration.ofMillis(50))));
+        await(follower, 10);
+        firstServer.close();
+        first.close();
+
+        Store second = open("leader-2", leaderOptions());
+        for (int i = 1; i <= 12; i++) {
+            second.put(utf8("k" + i), utf8(i <= 5 ? "first-" + i : "second-" + i)); // the same 1 to 5, then not
+        }
+        Server secondServer = track(Server.leader(second,
+                new Server.Config(new InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), port), 16,
+                        Duration.ofMillis(50))));
+        awaitState(follower, State.DIVERGED);
+        assertEquals(10, followerStore.lastSequence(), "nothing of the second history was applied");
+        assertArrayEquals(utf8("first-10"), followerStore.get(utf8("k10")).orElseThrow());
+        assertTrue(follower.status().detail().startsWith("DIVERGED: 10"), follower.status().detail());
+        assertEquals(0, secondServer.followers().size());
+    }
+
+    @Test
+    void syncChecksTheChecksumOfTheWriteBeforeFrom() throws Exception {
+        Store leaderStore = open("leader", leaderOptions());
+        Server leader = track(Server.leader(leaderStore, FAST));
+        write(leaderStore, 1, 10, new SplittableRandom(9));
+        long seven;
+        try (io.github.vivekdavara.keystore.LogTail tail = leaderStore.tail(7)) {
+            seven = io.github.vivekdavara.keystore.wal.WalFormat.storedChecksum(tail.poll());
+        }
+        assertEquals("ERR DIVERGED 7", firstLine(leader, "SYNC 8 " + ((seven + 1) & 0xffffffffL)));
+        assertTrue(firstLine(leader, "SYNC 8 " + seven).startsWith("REC "), "the right checksum streams");
+        assertTrue(firstLine(leader, "SYNC 8").startsWith("REC "), "no checksum: nothing to check");
+    }
+
+    private static String firstLine(Server leader, String request) throws IOException {
+        try (Socket socket = new Socket()) {
+            socket.connect(leader.address(), 5_000);
+            socket.setSoTimeout(10_000);
+            socket.getOutputStream().write((request + "\n").getBytes(StandardCharsets.US_ASCII));
+            return Protocol.readLine(new BufferedInputStream(socket.getInputStream()));
+        }
+    }
+
+    @Test
     void aFollowersServerAnswersReadsAndRefusesWrites() throws Exception {
         Store leaderStore = open("leader", leaderOptions());
         Server leader = track(Server.leader(leaderStore, FAST));

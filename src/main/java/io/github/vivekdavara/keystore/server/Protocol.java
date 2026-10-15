@@ -20,7 +20,7 @@ import java.nio.charset.StandardCharsets;
  * PUT klen vlen \n key value      OK seq
  * DEL klen \n key                 OK seq
  * INFO                            INFO name=value ...
- * SYNC from                       a stream of REC n \n record, and HEARTBEAT seq (leaders only)
+ * SYNC from [checksum]            a stream of REC n \n record, and HEARTBEAT seq (leaders only)
  * anything                        ERR CODE text
  * </pre>
  *
@@ -52,6 +52,11 @@ public final class Protocol {
         BEHIND,
         /** SYNC: the follower has writes the leader doesn't. The text is the leader's last sequence number. */
         AHEAD,
+        /**
+         * SYNC: the follower's write before {@code from} isn't the leader's (their checksums differ):
+         * their histories have diverged. The text is that sequence number.
+         */
+        DIVERGED,
         /** Anything else: an I/O error, a closed store. */
         INTERNAL
     }
@@ -76,8 +81,10 @@ public final class Protocol {
      * @param keyLength GET, PUT and DEL: the key's bytes, which follow the line
      * @param valueLength PUT: the value's bytes, which follow the key
      * @param from SYNC: the first sequence number wanted
+     * @param checksum SYNC: the stored checksum of the follower's write {@code from - 1}, which the
+     *     leader checks against its own, or -1 if the follower didn't send one
      */
-    public record Request(Command command, int keyLength, int valueLength, long from) {}
+    public record Request(Command command, int keyLength, int valueLength, long from, long checksum) {}
 
     /**
      * Parses a request line (without its newline).
@@ -97,22 +104,30 @@ public final class Protocol {
         };
         int arity = switch (command) {
             case PING, INFO -> 1;
-            case GET, DEL, SYNC -> 2;
+            case GET, DEL -> 2;
+            case SYNC -> words.length == 3 ? 3 : 2; // the checksum is optional
             case PUT -> 3;
         };
         if (words.length != arity) {
             throw new ProtocolException(command + " takes " + (arity - 1) + " numbers, not " + (words.length - 1));
         }
         return switch (command) {
-            case PING, INFO -> new Request(command, 0, 0, 0);
-            case GET, DEL -> new Request(command, keyLength(words[1]), 0, 0);
-            case PUT -> new Request(command, keyLength(words[1]), valueLength(words[2]), 0);
+            case PING, INFO -> new Request(command, 0, 0, 0, -1);
+            case GET, DEL -> new Request(command, keyLength(words[1]), 0, 0, -1);
+            case PUT -> new Request(command, keyLength(words[1]), valueLength(words[2]), 0, -1);
             case SYNC -> {
                 long from = number(words[1]);
                 if (from < 1) {
                     throw new ProtocolException("sequence numbers start at 1, not " + from);
                 }
-                yield new Request(command, 0, 0, from);
+                long checksum = -1;
+                if (words.length == 3) {
+                    checksum = number(words[2]);
+                    if (checksum > 0xffffffffL || from == 1) {
+                        throw new ProtocolException("a checksum is 0 to 4294967295, of the write before from");
+                    }
+                }
+                yield new Request(command, 0, 0, from, checksum);
             }
         };
     }

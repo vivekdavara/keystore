@@ -68,6 +68,11 @@ class FollowerStreamTest {
         return bytes;
     }
 
+    /** The stored checksum of record(seq), as a follower that applied it sends it in SYNC. */
+    private static long checksum(long seq) {
+        return WalFormat.storedChecksum(record(seq));
+    }
+
     private static void send(OutputStream out, byte[] record) throws IOException {
         out.write(("REC " + record.length + "\n").getBytes(StandardCharsets.US_ASCII));
         out.write(record);
@@ -129,7 +134,7 @@ class FollowerStreamTest {
         first.out().flush();
 
         Connection second = next();
-        assertEquals("SYNC 3", second.request(), "asks again from its own position");
+        assertEquals("SYNC 3 " + checksum(2), second.request(), "asks again from its own position, and says what #2 was");
         assertEquals(2, store.lastSequence(), "record 4 wasn't applied");
         awaitStreaming();
         assertTrue(follower.status().detail().contains("record 4"), follower.status().detail());
@@ -154,7 +159,7 @@ class FollowerStreamTest {
         send(first.out(), record(1)); // a repeat
         first.out().flush();
         Connection second = next();
-        assertEquals("SYNC 2", second.request());
+        assertEquals("SYNC 2 " + checksum(1), second.request());
         assertEquals(1, store.lastSequence());
 
         byte[] damaged = record(2);
@@ -162,7 +167,7 @@ class FollowerStreamTest {
         send(second.out(), damaged);
         second.out().flush();
         Connection third = next();
-        assertEquals("SYNC 2", third.request());
+        assertEquals("SYNC 2 " + checksum(1), third.request());
         assertEquals(1, store.lastSequence());
         assertTrue(follower.status().detail().contains("fails its checks"), follower.status().detail());
         first.socket().close();
@@ -184,7 +189,7 @@ class FollowerStreamTest {
         Connection second = next();
         // Records 1 and 2 passed their checks before the repeat came, still in the batch: they are
         // applied before the connection is dropped, so the follower asks only for what follows.
-        assertEquals("SYNC 3", second.request());
+        assertEquals("SYNC 3 " + checksum(2), second.request());
         assertEquals(2, store.lastSequence());
         first.socket().close();
         second.socket().close();
@@ -202,7 +207,7 @@ class FollowerStreamTest {
         first.out().write(burst.toByteArray());
         first.out().flush();
         Connection second = next();
-        assertEquals("SYNC 3", second.request(), "the records before the ERR were applied");
+        assertEquals("SYNC 3 " + checksum(2), second.request(), "the records before the ERR were applied");
 
         ByteArrayOutputStream behind = new ByteArrayOutputStream();
         send(behind, record(3));
@@ -216,6 +221,29 @@ class FollowerStreamTest {
         }
         assertEquals(3, store.lastSequence(), "and so was the one before BEHIND");
         first.socket().close();
+        second.socket().close();
+    }
+
+    @Test
+    void divergedStopsTheFollower() throws Exception {
+        startFakeLeader();
+        startFollower();
+        Connection first = next();
+        send(first.out(), record(1));
+        first.out().write("HEARTBEAT 1\n".getBytes(StandardCharsets.US_ASCII));
+        first.out().flush();
+        assertTrue(follower.awaitApplied(1, Duration.ofSeconds(10)));
+        first.socket().close();
+        Connection second = next();
+        assertEquals("SYNC 2 " + checksum(1), second.request());
+        second.out().write("ERR DIVERGED 1\n".getBytes(StandardCharsets.US_ASCII));
+        second.out().flush();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (follower.status().state() != Follower.State.DIVERGED) {
+            assertTrue(System.nanoTime() < deadline, follower.status().toString());
+            Thread.sleep(1);
+        }
+        assertTrue(connections.poll(200, TimeUnit.MILLISECONDS) == null, "it doesn't reconnect");
         second.socket().close();
     }
 

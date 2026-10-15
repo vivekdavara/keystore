@@ -22,15 +22,17 @@ import org.junit.jupiter.params.provider.ValueSource;
 class ProtocolTest {
     @Test
     void parsesEveryCommand() throws ProtocolException {
-        assertEquals(new Request(Command.PING, 0, 0, 0), Protocol.parse("PING"));
-        assertEquals(new Request(Command.INFO, 0, 0, 0), Protocol.parse("INFO"));
-        assertEquals(new Request(Command.GET, 3, 0, 0), Protocol.parse("GET 3"));
-        assertEquals(new Request(Command.DEL, 65536, 0, 0), Protocol.parse("DEL 65536"));
-        assertEquals(new Request(Command.PUT, 1, 0, 0), Protocol.parse("PUT 1 0"));
-        assertEquals(new Request(Command.PUT, 7, 16 * 1024 * 1024, 0), Protocol.parse("PUT 7 16777216"));
-        assertEquals(new Request(Command.SYNC, 0, 0, 1), Protocol.parse("SYNC 1"));
-        assertEquals(new Request(Command.SYNC, 0, 0, 999_999_999_999_999_999L),
+        assertEquals(new Request(Command.PING, 0, 0, 0, -1), Protocol.parse("PING"));
+        assertEquals(new Request(Command.INFO, 0, 0, 0, -1), Protocol.parse("INFO"));
+        assertEquals(new Request(Command.GET, 3, 0, 0, -1), Protocol.parse("GET 3"));
+        assertEquals(new Request(Command.DEL, 65536, 0, 0, -1), Protocol.parse("DEL 65536"));
+        assertEquals(new Request(Command.PUT, 1, 0, 0, -1), Protocol.parse("PUT 1 0"));
+        assertEquals(new Request(Command.PUT, 7, 16 * 1024 * 1024, 0, -1), Protocol.parse("PUT 7 16777216"));
+        assertEquals(new Request(Command.SYNC, 0, 0, 1, -1), Protocol.parse("SYNC 1"));
+        assertEquals(new Request(Command.SYNC, 0, 0, 999_999_999_999_999_999L, -1),
                 Protocol.parse("SYNC 999999999999999999"));
+        assertEquals(new Request(Command.SYNC, 0, 0, 2, 0), Protocol.parse("SYNC 2 0"));
+        assertEquals(new Request(Command.SYNC, 0, 0, 12, 4_294_967_295L), Protocol.parse("SYNC 12 4294967295"));
     }
 
     @ParameterizedTest
@@ -40,6 +42,7 @@ class ProtocolTest {
         "GET 0", "DEL 0", "GET 65537", "PUT 65537 1", "PUT 1 16777217", // limits, checked before any allocation
         "GET 01", "GET -1", "GET +1", "GET 1.0", "GET 0x10", "GET 1e3", "GET ١", // numbers
         "PUT 1 9999999999999999999", "SYNC 0", "SYNC 1000000000000000000",
+        "SYNC 2 4294967296", "SYNC 1 5", "SYNC 2 3 4", "SYNC 2 -1", // a checksum is 32 bits, of the write before from
     })
     void refusesWhatIsntARequest(String line) {
         assertThrows(ProtocolException.class, () -> Protocol.parse(line));

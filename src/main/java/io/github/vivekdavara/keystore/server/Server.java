@@ -7,6 +7,7 @@ import io.github.vivekdavara.keystore.server.Protocol.ErrorCode;
 import io.github.vivekdavara.keystore.server.Protocol.ProtocolException;
 import io.github.vivekdavara.keystore.server.Protocol.Request;
 import io.github.vivekdavara.keystore.wal.LogFullException;
+import io.github.vivekdavara.keystore.wal.WalFormat;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.Closeable;
@@ -46,7 +47,9 @@ import java.util.function.Supplier;
  * The follower answers with {@code ACK seq} (its last applied) after each batch and heartbeat; a
  * leader that hears nothing for ten heartbeats drops the connection. The stream ends with
  * {@code ERR BEHIND oldest} if the record wanted is in a log the leader no longer has, and is
- * refused with {@code ERR AHEAD last} if the follower has more writes than the leader.
+ * refused with {@code ERR AHEAD last} if the follower has more writes than the leader, or
+ * {@code ERR DIVERGED seq} if the follower's write before {@code from} isn't the leader's
+ * ({@code SYNC from checksum} carries its stored checksum).
  *
  * <p>Handler threads are never interrupted: an interrupt during a store's file I/O closes the
  * channel, which would fail the store. {@link #close} closes the sockets instead.
@@ -339,7 +342,7 @@ public final class Server implements Closeable {
                     Protocol.writeLine(out, Protocol.errorLine(ErrorCode.READONLY, "a follower serves no SYNC"));
                     return true;
                 }
-                ship(request.from(), socket, in, out);
+                ship(request.from(), request.checksum(), socket, in, out);
                 return false; // the stream was the rest of this connection
             }
         }
@@ -350,12 +353,18 @@ public final class Server implements Closeable {
      * Streams the store's records from {@code from} on to a follower until the connection breaks,
      * the server closes, or the tail fails. A thread of its own reads the follower's ACKs.
      */
-    private void ship(long from, Socket socket, InputStream in, OutputStream out) throws IOException {
+    private void ship(long from, long checksum, Socket socket, InputStream in, OutputStream out) throws IOException {
         long last = store.lastSequence();
         if (from - 1 > last) {
             // The follower has writes this leader doesn't: a leader that lost acknowledged writes in
             // a crash (under NEVER), or another leader's follower. Streaming would mix histories.
             Protocol.writeLine(out, Protocol.errorLine(ErrorCode.AHEAD, Long.toString(last)));
+            out.flush();
+            return;
+        }
+        String diverged = checkHistory(from, checksum);
+        if (diverged != null) {
+            Protocol.writeLine(out, diverged);
             out.flush();
             return;
         }
@@ -408,6 +417,31 @@ public final class Server implements Closeable {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    /**
+     * Checks the follower's write before {@code from} against this leader's, by their stored
+     * checksums, as Raft checks the term of the entry before the ones it sends. Returns the
+     * {@code ERR} line to refuse with, or null to go on: a leader that lost acknowledged writes in a
+     * crash (under NEVER) and then took others under the same numbers has a different history from a
+     * follower that got the lost ones, and streaming on would mix the two. If the follower sent no
+     * checksum, or the leader's log no longer holds that write, there is nothing to check against.
+     */
+    private String checkHistory(long from, long checksum) {
+        if (checksum < 0 || from < 2) {
+            return null;
+        }
+        try (LogTail previous = store.tail(from - 1)) {
+            byte[] record = previous.poll(); // acknowledged: from - 1 <= lastSequence()
+            if (record != null && WalFormat.storedChecksum(record) != checksum) {
+                return Protocol.errorLine(ErrorCode.DIVERGED, Long.toString(from - 1));
+            }
+            return null;
+        } catch (LogTail.BehindException e) {
+            return null; // in the tables only: unchecked, as for a follower that sends no checksum
+        } catch (IOException | IllegalStateException e) {
+            return Protocol.errorLine(ErrorCode.INTERNAL, e.getMessage());
         }
     }
 

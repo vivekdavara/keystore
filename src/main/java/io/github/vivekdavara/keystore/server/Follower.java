@@ -29,9 +29,11 @@ import java.util.concurrent.TimeUnit;
  * so it is exactly as durable as the store's writes.
  *
  * <p>Every record is checked twice: its checksum (the leader sends the bytes its log holds) and
- * its sequence number, which must be the next one. A store whose writes fail, or a leader that no
- * longer has the log it needs ({@link State#BEHIND}) or has fewer writes than it
- * ({@link State#AHEAD}), stops the follower: those need someone to act.
+ * its sequence number, which must be the next one. Each {@code SYNC} carries the stored checksum of
+ * the store's last write, when it knows it, and the leader refuses to stream if its own write with
+ * that number differs ({@link State#DIVERGED}). A store whose writes fail, or a leader that no
+ * longer has the log it needs ({@link State#BEHIND}), has fewer writes than it ({@link State#AHEAD})
+ * or a different history, stops the follower: those need someone to act.
  *
  * <p>The follower's thread is never interrupted (an interrupt during the store's file I/O would
  * close its log); {@link #close} closes the socket instead.
@@ -47,6 +49,8 @@ public final class Follower implements Closeable {
         BEHIND,
         /** Stopped: this store has writes the leader doesn't. */
         AHEAD,
+        /** Stopped: this store's last write isn't the leader's write with that sequence number. */
+        DIVERGED,
         /** Stopped: this store's writes failed, or it refused a record. */
         FAILED,
         /** Closed. */
@@ -167,7 +171,12 @@ public final class Follower implements Closeable {
                 connects++;
                 InputStream in = new BufferedInputStream(s.getInputStream(), 256 * 1024);
                 OutputStream out = new BufferedOutputStream(s.getOutputStream(), 8 * 1024);
-                Protocol.writeLine(out, "SYNC " + (store.lastSequence() + 1));
+                // The checksum of the store's last write, if it knows it, so the leader can check that
+                // their histories agree before streaming (only this thread writes the store, so the
+                // two reads agree).
+                long seq = store.lastSequence();
+                long checksum = store.lastChecksum();
+                Protocol.writeLine(out, "SYNC " + (seq + 1) + (seq > 0 && checksum >= 0 ? " " + checksum : ""));
                 out.flush();
                 state = State.STREAMING;
                 State stop = stream(in, out);
@@ -255,6 +264,9 @@ public final class Follower implements Closeable {
                     }
                     case AHEAD -> {
                         return State.AHEAD;
+                    }
+                    case DIVERGED -> {
+                        return State.DIVERGED;
                     }
                     default -> throw e;
                 }

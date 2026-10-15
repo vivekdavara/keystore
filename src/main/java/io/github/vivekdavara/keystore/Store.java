@@ -34,7 +34,10 @@ import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
 
@@ -87,6 +90,14 @@ public final class Store implements Closeable {
      * final-field guarantee covers what the field refers to, but not a volatile set in a constructor.
      */
     private final AtomicLong lastSeq;
+    /**
+     * For {@link #awaitSequence}: signalled when lastSeq advances or the store closes, and only if
+     * someone waits, so writes nobody follows don't take a second lock. A ReentrantLock, not a
+     * monitor: in Java 21 a virtual thread blocked in Object.wait pins its carrier thread.
+     */
+    private final ReentrantLock sequenceLock = new ReentrantLock();
+    private final Condition sequenceAdvanced = sequenceLock.newCondition();
+    private final AtomicInteger sequenceWaiters = new AtomicInteger();
     private WriteAheadLog log; // guarded by writeLock
     private Manifest manifest; // guarded by writeLock: as last written
     private long nextFileNumber; // guarded by writeLock
@@ -392,28 +403,122 @@ public final class Store implements Closeable {
             long seq = lastSeq.get() + 1;
             WalRecord record = value == null ? WalRecord.delete(seq, key) : WalRecord.put(seq, key, value);
             log.ensureRoomFor(record); // LogFullException: nothing written, the store goes on
-            boolean flushing = false;
-            try {
-                log.append(record);
-                if (options.sync() == SyncPolicy.EVERY_WRITE) {
-                    flushing = true;
-                    log.sync();
-                    flushing = false;
-                }
-                apply(current.active, record);
-            } catch (IOException | RuntimeException | Error e) {
-                // The log may now end in part of a record, or a flush may have dropped pages it was
-                // meant to write: appending more could bury that, and retrying a failed flush can
-                // falsely succeed. Stop writing; reopening recovers. (No later write can reuse this
-                // sequence number, since there are no later writes.)
-                failure = e;
-                failedFlush = flushing;
-                throw e;
-            }
-            lastSeq.set(seq); // only now: lastSequence() never names a write that reads can't see
+            appendAndApply(List.of(record));
             return seq;
         } finally {
             writeLock.unlock();
+        }
+    }
+
+    /**
+     * Applies writes a leader made, with the leader's sequence numbers: how a follower takes its
+     * writes. The first must be the one after {@link #lastSequence()}, and the rest must follow
+     * without a gap. They are appended to this store's own log, forced once for all of them under
+     * {@link SyncPolicy#EVERY_WRITE} (a follower's group commit: one force a batch, not a record),
+     * applied, and only then visible. Fails like {@link #put}. Keeps the records' arrays.
+     *
+     * @throws IllegalArgumentException if the records don't continue from {@link #lastSequence()},
+     *     or one is outside the limits; nothing is written
+     */
+    public void replicate(List<WalRecord> records) throws IOException {
+        if (records.isEmpty()) {
+            return;
+        }
+        long bytes = 0;
+        for (int i = 0; i < records.size(); i++) {
+            WalRecord r = records.get(i);
+            WalFormat.checkLimits(r.seq(), r.key(), r.value());
+            if (i > 0 && r.seq() != records.get(i - 1).seq() + 1) {
+                throw new IllegalArgumentException("record " + r.seq() + " follows " + records.get(i - 1).seq());
+            }
+            bytes += WalFormat.encodedSize(r);
+        }
+        writeLock.lock();
+        try {
+            ensureWritable();
+            if (records.get(0).seq() != lastSeq.get() + 1) {
+                throw new IllegalArgumentException(
+                        "record " + records.get(0).seq() + " doesn't follow this store's last, " + lastSeq.get());
+            }
+            if (log.size() >= options.flushLogBytes()) {
+                flushAndCompact();
+            }
+            log.ensureRoomFor(bytes);
+            appendAndApply(records);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /** Appends records, forces them under EVERY_WRITE, applies them, then publishes them. Under writeLock. */
+    private void appendAndApply(List<WalRecord> records) throws IOException {
+        boolean flushing = false;
+        try {
+            for (WalRecord record : records) {
+                log.append(record);
+            }
+            if (options.sync() == SyncPolicy.EVERY_WRITE) {
+                flushing = true;
+                log.sync();
+                flushing = false;
+            }
+            for (WalRecord record : records) {
+                apply(current.active, record);
+            }
+        } catch (IOException | RuntimeException | Error e) {
+            // The log may now end in part of a record, or a flush may have dropped pages it was
+            // meant to write: appending more could bury that, and retrying a failed flush can
+            // falsely succeed. Stop writing; reopening recovers. (No later write can reuse this
+            // sequence number, since there are no later writes.)
+            failure = e;
+            failedFlush = flushing;
+            throw e;
+        }
+        // Only now: lastSequence() never names a write that reads can't see.
+        lastSeq.set(records.get(records.size() - 1).seq());
+        signalSequence();
+    }
+
+    /**
+     * Waits until {@link #lastSequence()} reaches {@code seq}, the timeout passes, or the store
+     * closes; returns whether it reached {@code seq}. For readers that follow the log.
+     */
+    public boolean awaitSequence(long seq, long timeout, TimeUnit unit) throws InterruptedException {
+        if (lastSeq.get() >= seq) {
+            return true;
+        }
+        long nanos = unit.toNanos(timeout);
+        // Counted before lastSeq is read under the lock, and a writer sets lastSeq before reading
+        // the count: so either the writer sees this waiter and signals, or this waiter sees the write.
+        sequenceWaiters.incrementAndGet();
+        sequenceLock.lock();
+        try {
+            while (lastSeq.get() < seq) {
+                if (nanos <= 0 || closed) {
+                    return false;
+                }
+                nanos = sequenceAdvanced.awaitNanos(nanos);
+            }
+            return true;
+        } finally {
+            sequenceLock.unlock();
+            sequenceWaiters.decrementAndGet();
+        }
+    }
+
+    /** Threads in {@link #awaitSequence} now, for tests. */
+    int sequenceWaiters() {
+        return sequenceWaiters.get();
+    }
+
+    private void signalSequence() {
+        if (sequenceWaiters.get() > 0) {
+            sequenceLock.lock();
+            try {
+                sequenceAdvanced.signalAll();
+            } finally {
+                sequenceLock.unlock();
+            }
         }
     }
 
@@ -876,6 +981,7 @@ public final class Store implements Closeable {
                 return;
             }
             closed = true;
+            signalSequence(); // waiters give up
             try {
                 closeLog();
             } finally {

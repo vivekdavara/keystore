@@ -129,7 +129,12 @@ public final class WriteAheadLog implements Closeable {
      * Nothing is written either way, so the log is as it was.
      */
     public void ensureRoomFor(WalRecord record) throws LogFullException {
-        long after = size + WalFormat.encodedSize(record);
+        ensureRoomFor((long) WalFormat.encodedSize(record));
+    }
+
+    /** {@link #ensureRoomFor(WalRecord)} for records that take {@code bytes} in all. */
+    public void ensureRoomFor(long bytes) throws LogFullException {
+        long after = size + bytes;
         if (after > maxBytes) {
             throw new LogFullException("the log is " + size + " bytes; this write would take it to " + after
                     + ", past its limit of " + maxBytes);

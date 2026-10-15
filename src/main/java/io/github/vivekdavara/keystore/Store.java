@@ -355,27 +355,30 @@ public final class Store implements Closeable {
      * full enough flushes the memtable first, and a failed flush fails it the same way (the write
      * itself was not made).
      *
+     * @return the write's sequence number
      * @throws IllegalArgumentException if the key is empty or longer than 65,536 bytes, or the value
      *     is longer than 16 MiB; nothing is written
      */
-    public void put(byte[] key, byte[] value) throws IOException {
+    public long put(byte[] key, byte[] value) throws IOException {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
         WalFormat.checkLimits(1, key, value);
-        write(key.clone(), value.clone()); // the caller may reuse its arrays
+        return write(key.clone(), value.clone()); // the caller may reuse its arrays
     }
 
     /**
      * Deletes {@code key}: later reads find nothing, until the key is put again. Deleting a key that
      * isn't there is still a write. Fails like {@link #put}.
+     *
+     * @return the write's sequence number
      */
-    public void delete(byte[] key) throws IOException {
+    public long delete(byte[] key) throws IOException {
         Objects.requireNonNull(key, "key");
         WalFormat.checkLimits(1, key, null);
-        write(key.clone(), null);
+        return write(key.clone(), null);
     }
 
-    private void write(byte[] key, byte[] value) throws IOException {
+    private long write(byte[] key, byte[] value) throws IOException {
         writeLock.lock();
         try {
             ensureWritable();
@@ -404,6 +407,7 @@ public final class Store implements Closeable {
                 throw e;
             }
             lastSeq.set(seq); // only now: lastSequence() never names a write that reads can't see
+            return seq;
         } finally {
             writeLock.unlock();
         }

@@ -1,5 +1,6 @@
 package io.github.vivekdavara.keystore.server;
 
+import io.github.vivekdavara.keystore.LogTail;
 import io.github.vivekdavara.keystore.Store;
 import io.github.vivekdavara.keystore.StoreFailedException;
 import io.github.vivekdavara.keystore.server.Protocol.ErrorCode;
@@ -16,13 +17,18 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketAddress;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
@@ -33,6 +39,14 @@ import java.util.function.Supplier;
  *
  * <p>A leader takes writes and serves {@code SYNC} to followers; a follower answers reads and
  * {@code INFO}, and refuses writes with {@code ERR READONLY} (its writes come from its leader).
+ *
+ * <p>{@code SYNC from} turns a connection into a replication stream: the leader sends every record
+ * from {@code from} on as {@code REC n} and the record's {@code n} bytes, exactly as its log holds
+ * them, then follows new writes, with {@code HEARTBEAT seq} (its last sequence number) when idle.
+ * The follower answers with {@code ACK seq} (its last applied) after each batch and heartbeat; a
+ * leader that hears nothing for ten heartbeats drops the connection. The stream ends with
+ * {@code ERR BEHIND oldest} if the record wanted is in a log the leader no longer has, and is
+ * refused with {@code ERR AHEAD last} if the follower has more writes than the leader.
  *
  * <p>Handler threads are never interrupted: an interrupt during a store's file I/O closes the
  * channel, which would fail the store. {@link #close} closes the sockets instead.
@@ -86,6 +100,7 @@ public final class Server implements Closeable {
     private final Semaphore slots;
     private final Set<Socket> connections = ConcurrentHashMap.newKeySet();
     private final Set<Thread> handlers = ConcurrentHashMap.newKeySet();
+    private final Map<Socket, FollowerConnection> followers = new ConcurrentHashMap<>();
     private final Thread acceptor;
     private volatile boolean closing;
 
@@ -141,6 +156,34 @@ public final class Server implements Closeable {
     /** Connections open now. */
     public int connections() {
         return connections.size();
+    }
+
+    /**
+     * A follower's {@code SYNC} stream, as the leader sees it.
+     *
+     * @param sent the last sequence number sent to it, or {@code from - 1} before the first
+     * @param acked the last sequence number it said it applied, or -1 before its first ACK
+     */
+    public record FollowerInfo(SocketAddress address, long sent, long acked) {}
+
+    /** The followers streaming from this leader now. */
+    public List<FollowerInfo> followers() {
+        List<FollowerInfo> out = new ArrayList<>();
+        for (FollowerConnection f : followers.values()) {
+            out.add(new FollowerInfo(f.address, f.sent, f.acked));
+        }
+        return out;
+    }
+
+    private static final class FollowerConnection {
+        final SocketAddress address;
+        volatile long sent;
+        volatile long acked = -1;
+
+        FollowerConnection(SocketAddress address, long sent) {
+            this.address = address;
+            this.sent = sent;
+        }
     }
 
     private void accept() {
@@ -223,7 +266,7 @@ public final class Server implements Closeable {
                     if (line == null) {
                         return; // the client closed between requests
                     }
-                    if (!answer(Protocol.parse(line), in, out)) {
+                    if (!answer(Protocol.parse(line), socket, in, out)) {
                         return;
                     }
                     if (in.available() == 0) {
@@ -245,7 +288,7 @@ public final class Server implements Closeable {
     }
 
     /** Answers one request; false if the connection should close. */
-    private boolean answer(Request request, InputStream in, OutputStream out) throws IOException {
+    private boolean answer(Request request, Socket socket, InputStream in, OutputStream out) throws IOException {
         switch (request.command()) {
             case PING -> Protocol.writeLine(out, "PONG");
             case INFO -> Protocol.writeLine(out, info());
@@ -278,11 +321,114 @@ public final class Server implements Closeable {
                     Protocol.writeLine(out, Protocol.errorLine(ErrorCode.READONLY, "a follower serves no SYNC"));
                     return true;
                 }
-                Protocol.writeLine(out, Protocol.errorLine(ErrorCode.INTERNAL, "SYNC is not built yet"));
-                return true;
+                ship(request.from(), socket, in, out);
+                return false; // the stream was the rest of this connection
             }
         }
         return true;
+    }
+
+    /**
+     * Streams the store's records from {@code from} on to a follower until the connection breaks,
+     * the server closes, or the tail fails. A thread of its own reads the follower's ACKs.
+     */
+    private void ship(long from, Socket socket, InputStream in, OutputStream out) throws IOException {
+        long last = store.lastSequence();
+        if (from - 1 > last) {
+            // The follower has writes this leader doesn't: a leader that lost acknowledged writes in
+            // a crash (under NEVER), or another leader's follower. Streaming would mix histories.
+            Protocol.writeLine(out, Protocol.errorLine(ErrorCode.AHEAD, Long.toString(last)));
+            out.flush();
+            return;
+        }
+        LogTail tail;
+        try {
+            tail = store.tail(from);
+        } catch (IllegalStateException e) {
+            Protocol.writeLine(out, Protocol.errorLine(ErrorCode.INTERNAL, e.getMessage()));
+            out.flush();
+            return;
+        }
+        FollowerConnection follower = new FollowerConnection(socket.getRemoteSocketAddress(), from - 1);
+        followers.put(socket, follower);
+        Thread acks = Thread.ofVirtual().name("keystore-acks").start(() -> readAcks(socket, in, follower));
+        try (tail) {
+            long heartbeat = config.heartbeat().toNanos();
+            while (!closing) {
+                byte[] record = nextRecord(tail, 0);
+                if (record == null) {
+                    out.flush(); // caught up: send what's buffered before waiting
+                    record = nextRecord(tail, heartbeat);
+                }
+                if (record == null) {
+                    Protocol.writeLine(out, "HEARTBEAT " + store.lastSequence());
+                    out.flush();
+                    continue;
+                }
+                Protocol.writeLine(out, "REC " + record.length);
+                out.write(record);
+                follower.sent = tail.nextSequence() - 1;
+            }
+        } catch (StreamEnd end) {
+            Protocol.writeLine(out, end.line);
+            out.flush();
+        } finally {
+            followers.remove(socket);
+            closeQuietly(socket); // ends the ACK reader too
+            try {
+                acks.join(5_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /** Why a stream ended, as the {@code ERR} line to end it with. */
+    private static final class StreamEnd extends Exception {
+        private static final long serialVersionUID = 1L;
+
+        final String line;
+
+        StreamEnd(String line) {
+            super(line, null, false, false);
+            this.line = line;
+        }
+    }
+
+    /** The tail's next record, waiting up to {@code nanos}; null if none came. */
+    private static byte[] nextRecord(LogTail tail, long nanos) throws StreamEnd {
+        try {
+            return nanos == 0 ? tail.poll() : tail.next(nanos, TimeUnit.NANOSECONDS);
+        } catch (LogTail.BehindException e) {
+            throw new StreamEnd(Protocol.errorLine(ErrorCode.BEHIND, Long.toString(e.oldest())));
+        } catch (IOException | IllegalStateException e) {
+            throw new StreamEnd(Protocol.errorLine(ErrorCode.INTERNAL, e.getMessage()));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new StreamEnd(Protocol.errorLine(ErrorCode.INTERNAL, "interrupted"));
+        }
+    }
+
+    /**
+     * Reads a follower's {@code ACK seq} lines. Ten heartbeats of silence, or anything that isn't an
+     * ACK, closes the connection, which stops the stream at its next write: so a follower that
+     * vanished without closing its end doesn't keep a stream (and an old log) open for good.
+     */
+    private void readAcks(Socket socket, InputStream in, FollowerConnection follower) {
+        try {
+            socket.setSoTimeout(Math.toIntExact(Math.max(1, config.heartbeat().toMillis() * 10)));
+            for (;;) {
+                String line = Protocol.readLine(in);
+                if (line == null || !line.startsWith("ACK ")) {
+                    return;
+                }
+                follower.acked = Protocol.number(line.substring(4));
+            }
+        } catch (IOException e) {
+            // Silence, or the connection broke.
+        } finally {
+            closeQuietly(socket);
+        }
     }
 
     /** Makes a write and returns the reply line. */
@@ -309,6 +455,9 @@ public final class Server implements Closeable {
     private String info() {
         String line = "INFO role=" + role.name().toLowerCase(Locale.ROOT) + " seq=" + store.lastSequence()
                 + " connections=" + connections.size();
+        if (role == Role.LEADER) {
+            line += " followers=" + followers.size();
+        }
         if (status != null) {
             line += " " + status.get();
         }

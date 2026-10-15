@@ -111,6 +111,38 @@ class ReplicateTest {
     }
 
     @Test
+    void aBatchBiggerThanALogsRoomGoesInRunsWithFlushesBetween() throws IOException {
+        // Flushed at 1 KiB and capped at 4 KiB, as a leader whose single writes always fit; the batch
+        // is about 12 KiB. From the review: in one piece it failed with LogFullException.
+        Options options = Options.defaults().withSync(SyncPolicy.NEVER).withFlushLogBytes(1024).withMaxLogBytes(4096);
+        try (Store store = Store.open(dir, options)) {
+            store.replicate(records(1, 400));
+            assertEquals(400, store.lastSequence());
+            assertTrue(store.stats().flushes() >= 10, "flushes: " + store.stats().flushes());
+            assertTrue(store.logSize() < 1024 + 64, "the log ends no fuller than a leader's would: " + store.logSize());
+            assertArrayEquals(utf8("v398"), store.get(utf8("k398")).orElseThrow());
+            assertEquals(Optional.empty(), store.get(utf8("k399")), "deleted by #400");
+        }
+        try (Store store = Store.open(dir, options)) {
+            assertEquals(400, store.lastSequence());
+            assertArrayEquals(utf8("v1"), store.get(utf8("k1")).orElseThrow());
+        }
+    }
+
+    @Test
+    void aRunThatDoesntFitLeavesTheRunsBeforeItApplied() throws IOException {
+        // A follower whose log limit is below its leader's: the second record is too big for any log.
+        try (Store store = Store.open(dir, Options.defaults().withSync(SyncPolicy.NEVER).withFlushLogBytes(100)
+                .withMaxLogBytes(300))) {
+            List<WalRecord> batch = List.of(WalRecord.put(1, utf8("a"), new byte[100]),
+                    WalRecord.put(2, utf8("b"), new byte[400]), WalRecord.put(3, utf8("c"), utf8("x")));
+            assertThrows(LogFullException.class, () -> store.replicate(batch));
+            assertEquals(1, store.lastSequence(), "the first run went in; lastSequence() says how far");
+            assertEquals(Optional.empty(), store.get(utf8("b")));
+        }
+    }
+
+    @Test
     void aBatchPastTheLogsLimitWritesNothing() throws IOException {
         try (Store store = Store.open(dir, Options.defaults().withSync(SyncPolicy.NEVER).withMaxLogBytes(1000))) {
             assertThrows(LogFullException.class, () -> store.replicate(records(1, 100)));

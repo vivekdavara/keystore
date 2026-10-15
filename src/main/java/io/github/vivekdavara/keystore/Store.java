@@ -417,6 +417,12 @@ public final class Store implements Closeable {
      * {@link SyncPolicy#EVERY_WRITE} (a follower's group commit: one force a batch, not a record),
      * applied, and only then visible. Fails like {@link #put}. Keeps the records' arrays.
      *
+     * <p>A batch that would take the log past {@link Options#flushLogBytes} is applied in runs, with
+     * a flush before each run that finds the log full enough, just as the leader flushed between
+     * the same writes; each run is forced once. So a batch never needs more room in a log than the
+     * leader's writes did, however big it is. If a run doesn't fit ({@link LogFullException}), the
+     * runs before it are applied and {@link #lastSequence()} says how far.
+     *
      * @throws IllegalArgumentException if the records don't continue from {@link #lastSequence()},
      *     or one is outside the limits; nothing is written
      */
@@ -424,14 +430,12 @@ public final class Store implements Closeable {
         if (records.isEmpty()) {
             return;
         }
-        long bytes = 0;
         for (int i = 0; i < records.size(); i++) {
             WalRecord r = records.get(i);
             WalFormat.checkLimits(r.seq(), r.key(), r.value());
             if (i > 0 && r.seq() != records.get(i - 1).seq() + 1) {
                 throw new IllegalArgumentException("record " + r.seq() + " follows " + records.get(i - 1).seq());
             }
-            bytes += WalFormat.encodedSize(r);
         }
         writeLock.lock();
         try {
@@ -440,11 +444,24 @@ public final class Store implements Closeable {
                 throw new IllegalArgumentException(
                         "record " + records.get(0).seq() + " doesn't follow this store's last, " + lastSeq.get());
             }
-            if (log.size() >= options.flushLogBytes()) {
-                flushAndCompact();
+            // Found by review: the batch went into the log in one piece, and a follower with its
+            // leader's options failed with LogFullException on writes the leader had taken one at a
+            // time, flushing between them.
+            int from = 0;
+            while (from < records.size()) {
+                if (log.size() >= options.flushLogBytes()) {
+                    flushAndCompact();
+                }
+                long size = log.size();
+                long bytes = 0;
+                int to = from;
+                do { // the records a leader would append before its log reached flushLogBytes
+                    bytes += WalFormat.encodedSize(records.get(to++));
+                } while (to < records.size() && size + bytes < options.flushLogBytes());
+                log.ensureRoomFor(bytes); // LogFullException: the runs before this one are applied
+                appendAndApply(records.subList(from, to));
+                from = to;
             }
-            log.ensureRoomFor(bytes);
-            appendAndApply(records);
         } finally {
             writeLock.unlock();
         }

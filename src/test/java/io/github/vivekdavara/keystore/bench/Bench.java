@@ -8,12 +8,18 @@ import io.github.vivekdavara.keystore.memtable.MemTable;
 import io.github.vivekdavara.keystore.memtable.SkipList;
 import io.github.vivekdavara.keystore.server.Client;
 import io.github.vivekdavara.keystore.server.Follower;
+import io.github.vivekdavara.keystore.server.Protocol;
 import io.github.vivekdavara.keystore.server.Server;
 import io.github.vivekdavara.keystore.wal.RecoveryMode;
 import io.github.vivekdavara.keystore.wal.WalFormat;
 import io.github.vivekdavara.keystore.wal.WalReader;
 import io.github.vivekdavara.keystore.wal.WalRecord;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -52,6 +58,9 @@ import java.util.stream.Stream;
  *                                 holds COUNT puts: time, records/s, batches
  * lag COUNT VALUE_BYTES SYNC      one put at a time to a leader, timed until a follower (under SYNC)
  *                                 has applied it
+ * pipeline DEPTH COUNT VALUE_BYTES
+ *                                 COUNT puts then COUNT gets on one connection, DEPTH requests sent
+ *                                 before their replies are read
  * </pre>
  */
 public final class Bench {
@@ -69,6 +78,7 @@ public final class Bench {
             case "server" -> server(Integer.parseInt(args[1]), Integer.parseInt(args[2]), Integer.parseInt(args[3]));
             case "catchup" -> catchup(Integer.parseInt(args[1]), Integer.parseInt(args[2]), SyncPolicy.valueOf(args[3]));
             case "lag" -> lag(Integer.parseInt(args[1]), Integer.parseInt(args[2]), SyncPolicy.valueOf(args[3]));
+            case "pipeline" -> pipeline(Integer.parseInt(args[1]), Integer.parseInt(args[2]), Integer.parseInt(args[3]));
             default -> throw new IllegalArgumentException("unknown benchmark " + args[0]);
         }
     }
@@ -418,6 +428,68 @@ public final class Bench {
             throw new AssertionError("a client failed", failures.get(0));
         }
         return end - start;
+    }
+
+    /**
+     * Pipelining on one connection: DEPTH requests written before the first reply is read, so the
+     * server finds them already buffered and answers them with one write (it flushes only when no
+     * request is waiting). DEPTH 1 is the request-reply loop of {@code server 1}. Raw protocol, so
+     * the client's own one-at-a-time API doesn't get in the way.
+     */
+    private static void pipeline(int depth, int count, int valueBytes) throws Exception {
+        byte[] value = randomBytes(valueBytes, 14);
+        for (int run = 0; run < 2; run++) { // run 0 warms up
+            Path dir = Files.createTempDirectory("keystore-bench");
+            try (Store store = Store.open(dir, Options.defaults().withSync(SyncPolicy.NEVER));
+                    Server server = Server.leader(store, Server.Config.loopback(0));
+                    Socket socket = new Socket()) {
+                socket.connect(server.address(), 5_000);
+                socket.setTcpNoDelay(true);
+                OutputStream out = new BufferedOutputStream(socket.getOutputStream(), 1 << 20);
+                InputStream in = new BufferedInputStream(socket.getInputStream(), 1 << 20);
+                byte[] putLine = ("PUT 16 " + valueBytes + "\n").getBytes(StandardCharsets.US_ASCII);
+                byte[] getLine = "GET 16\n".getBytes(StandardCharsets.US_ASCII);
+                long t0 = System.nanoTime();
+                for (int i = 0; i < count; i += depth) {
+                    int n = Math.min(depth, count - i);
+                    for (int j = 0; j < n; j++) {
+                        out.write(putLine);
+                        out.write(key(i + j));
+                        out.write(value);
+                    }
+                    out.flush();
+                    for (int j = 0; j < n; j++) {
+                        String reply = Protocol.readLine(in);
+                        if (reply == null || !reply.startsWith("OK ")) {
+                            throw new AssertionError("put " + (i + j) + ": " + reply);
+                        }
+                    }
+                }
+                long t1 = System.nanoTime();
+                for (int i = 0; i < count; i += depth) {
+                    int n = Math.min(depth, count - i);
+                    for (int j = 0; j < n; j++) {
+                        out.write(getLine);
+                        out.write(key(i + j));
+                    }
+                    out.flush();
+                    for (int j = 0; j < n; j++) {
+                        String reply = Protocol.readLine(in);
+                        if (reply == null || !reply.equals("VALUE " + valueBytes)) {
+                            throw new AssertionError("get " + (i + j) + ": " + reply);
+                        }
+                        Protocol.readExactly(in, valueBytes);
+                    }
+                }
+                long t2 = System.nanoTime();
+                if (run == 1) {
+                    System.out.printf("pipeline depth=%d count=%d value=%dB: puts %.0f/s, gets %.0f/s%n",
+                            depth, count, valueBytes, count / seconds(t0, t1), count / seconds(t1, t2));
+                }
+            } finally {
+                delete(dir);
+            }
+        }
     }
 
     /**

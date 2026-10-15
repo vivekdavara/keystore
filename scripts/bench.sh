@@ -25,6 +25,9 @@ if [ "$day" = all ] || [ "$day" = 3 ]; then
     done
     for _ in $(seq "$runs"); do bench lag 10000 100 NEVER; done
     for _ in $(seq "$runs"); do bench lag 1000 100 EVERY_WRITE; done
+    for depth in 1 16 128; do
+        for _ in $(seq "$runs"); do bench pipeline "$depth" 200000 100; done
+    done
     [ "$day" = 3 ] && exit 0
 fi
 if [ "$day" = all ] || [ "$day" = 2 ]; then

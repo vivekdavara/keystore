@@ -181,7 +181,7 @@ CI runs it on Linux and macOS.
 | A fault at every single write and force of a flush, a merge and a write that flushes, both sync policies, then close and reopen: nothing acknowledged lost, close's answer right (from the review) | `FlushMergeFaultCloseTest` |
 | Four readers alongside constant flushes and merges never miss a key or read a stale value; no file is left open or behind | `StoreConcurrencyTest` |
 | **Day 3** | |
-| Every command parses; 29 lines that aren't requests (spacing, case, signs, leading zeros, lengths one past each limit) are refused before anything is allocated | `ProtocolTest` |
+| Every command parses; 33 lines that aren't requests (spacing, case, signs, leading zeros, lengths one past each limit, bad `SYNC` checksums) are refused before anything is allocated | `ProtocolTest` |
 | Any bytes as keys and values; 2,000 pipelined requests answered in order; bad requests get `ERR PROTOCOL` and a closed connection; a follower refuses writes; the connection limit; 8 concurrent clients get distinct, ordered sequence numbers | `ServerTest` |
 | `replicate` takes the leader's numbers or nothing; one force for a batch; `awaitSequence` wakes on a write and on close | `ReplicateTest` |
 | Retention keeps an unbroken run of the newest covered logs, across flushes and reopens | `LogRetentionTest` |
@@ -204,8 +204,10 @@ after a warm-up run in the same JVM, and each figure below is the median of 5 ru
 ### Day 3: the server and replication
 
 Measured on an Apple M3 (macOS 26.6.2, the internal SSD, APFS) with Homebrew OpenJDK 21.0.12, **on power**
-(charging, Low Power Mode off), with nothing else running: `scripts/bench.sh 5 3` at `c239820`, 17:34 to 17:41.
-Everything is over loopback TCP on one machine; keys are 16 bytes and values 100; the data is synthetic.
+(charging, Low Power Mode off), with nothing else running: `scripts/bench.sh 5 3` at `c239820`, 17:34 to 17:41, and
+the pipeline lines it now ends with (`Bench pipeline DEPTH 200000 100`, 5 runs each, added after) at `800f5d3`,
+17:53 to 17:55. Everything is over loopback TCP on one machine; keys are 16 bytes and values 100; the data is
+synthetic.
 
 | What | Median of 5 (range) | Command |
 |---|---|---|
@@ -219,13 +221,19 @@ Everything is over loopback TCP on one machine; keys are 16 bytes and values 100
 | The same, the follower's store under `EVERY_WRITE` (one force a batch) | 6,549 ms: 152,697 records/s, 22 MB/s (150,124–154,149/s) | `Bench catchup 1000000 100 EVERY_WRITE` |
 | One write's replication lag (from the leader's `put` returning to the follower having applied it), follower under `NEVER` | p50 28.0 µs, p99 73.3 µs, slowest 1.4 ms (p50 27.8–28.1 µs) | `Bench lag 10000 100 NEVER` |
 | The same, follower under `EVERY_WRITE` | p50 2,959 µs, p99 4,201 µs, slowest 11.0 ms (p50 2,895–2,964 µs) | `Bench lag 1000 100 EVERY_WRITE` |
+| One connection, pipelined: 16 requests sent before their replies are read | puts 147,534/s (143,700–148,630); gets 214,907/s (213,172–216,361) | `Bench pipeline 16 200000 100` |
+| The same, 128 at a time | puts 175,815/s (175,000–177,837); gets 292,803/s (291,323–294,901) | `Bench pipeline 128 200000 100` |
+| The same, one at a time (as `server 1`) | puts 35,253/s; gets 40,140/s | `Bench pipeline 1 200000 100` |
 | For comparison, one 128-byte append and force in C (`target/fsync_cost target 1000`) | `F_FULLFSYNC` p50 2,994 µs; `fsync` p50 27 µs | `scripts/bench.sh` |
 
 - **One connection's round trip is about 26 µs**, of which the store's own put is about 2 µs (day 2's p50 under
   `NEVER`); the rest is the client, loopback TCP and the server's thread.
 - **Puts stop scaling at 4 connections** (68,199/s at 4, 68,795/s at 16): writes are serialised by the store's write
-  lock, so more connections only queue (the p50 goes from 50 µs to 217 µs). Gets, which take no lock, keep scaling,
-  to 107,105/s on 16 connections.
+  lock, and with several connections waiting, each write hands the lock to a parked thread, so more connections only
+  queue (the p50 goes from 50 µs to 217 µs). It isn't the lock's capacity: one pipelined connection, which never
+  contends for it, puts 147,534 a second. Gets, which take no lock, keep scaling, to 107,105/s on 16 connections.
+- **Pipelining pays because the server flushes only when no request is waiting**: 16 requests in flight give 4.2
+  times the puts and 5.4 times the gets of one at a time, answered in a few writes rather than one each.
 - **Catching up batches itself.** Every one of the 977 batches was full (1,024 records): a follower that is behind
   always has more waiting. That is what makes a forcing follower practical: under `EVERY_WRITE` it applied 152,697
   writes a second, where day 1's store forcing each write managed 361. The forces added 1.8 s, 1.9 ms a batch, less

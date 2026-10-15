@@ -1,21 +1,24 @@
 # Keystore walkthrough
 
 Questions an interviewer is likely to ask about this project, with short answers grounded in the code. Each answer
-names the file or test to open. Day 1 covered the memtable, the write-ahead log, recovery and the store; day 2 adds
-tables, the flush, the manifest, versions and compaction ("Tables and compaction", below).
+names the file or test to open. Day 1 covered the memtable, the write-ahead log, recovery and the store; day 2 added
+tables, the flush, the manifest, versions and compaction ("Tables and compaction", below); day 3 adds the server and
+replication ("The server and replication", below).
 
 **Reading order:** DESIGN.md "Write path" and "Recovery" → `Store.write` → `memtable/SkipList.put` →
 `wal/WalFormat` (the table at the top) → `wal/WalReader.read` → `StoreFaultTest` and `StoreLockTest`. For day 2:
 DESIGN.md "Tables", "The flush", "Versions" and "Compaction" → `sstable/TableFormat` (the format at the top) →
 `sstable/Table.get` → `Store.flushMemtable`, `Store.get`, `Store.merge` → `Version` → `TableCrashCycleTest` and
-`StoreConcurrencyTest`.
+`StoreConcurrencyTest`. For day 3: DESIGN.md "The server" and "Replication" → `server/Protocol` (the table at the
+top) → `server/Server.serve`, `answer`, `ship` → `LogTail.read` and `open` → `server/Follower.run` and `stream` →
+`Store.replicate` and `awaitSequence` → `ReplicationTest`.
 
 ## The big picture
 
 **What is it, in one sentence?**
 A key-value store built like LevelDB: writes go to a write-ahead log and a sorted in-memory table, which is flushed
-to immutable sorted files (SSTables) that compaction merges; on day 3 a TCP server and log-shipping replication go
-on top.
+to immutable sorted files (SSTables) that compaction merges, with a TCP server and log-shipping replication on
+top.
 
 **Why an LSM tree and not a B-tree?**
 An LSM tree turns random writes into sequential ones: a write is one append to the log plus an in-memory insert,
@@ -311,9 +314,103 @@ They wait: both run in the writing thread under the write lock. Reads don't wait
 `bench fill` waited 254 ms (median of 5 runs) for a flush and a merge. LevelDB and RocksDB do this work on background threads and only slow writers
 down when it falls behind; that's day 4's, with group commit.
 
+## The server and replication (day 3)
+
+**What does the protocol look like, and why lengths instead of delimiters?**
+One line of ASCII naming the command and the lengths, then the bytes: `PUT 4 6\n` then `cityBoston`, answered with
+`OK 1` (the sequence number). It's memcached's text protocol shape. With lengths up front, keys and values can hold
+any bytes (newlines included) without escaping, and the server knows how much to read before reading it, so it can
+refuse a bad length from the line alone, before allocating (`Protocol.parse`, `ProtocolTest.refusesWhatIsntARequest`).
+It's also easy to type at with `nc` while debugging, which a binary protocol isn't.
+
+**How does the server handle many clients?**
+One virtual thread a connection (Java 21), running a plain read-answer loop (`Server.serve`), so the code is
+straight-line blocking I/O and the JVM runs them all on a few carrier threads. A connection's
+replies come in its requests' order, and a reply is flushed only when nothing else is buffered, so a client that
+pipelines gets its replies batched (`ServerTest.pipelinedRequestsAreAnsweredInOrder`: 2,000 pairs sent before reading).
+
+**Why can't the server interrupt its handler threads on shutdown?**
+Because an interrupt during a `FileChannel` operation closes the channel. If a handler were in `store.put` when
+interrupted, the log's channel would close, and the store would refuse every write until a reopen. Day 2 hit the
+same thing for table reads. So `Server.close()` closes the sockets: a blocked read fails, a request in progress
+finishes its store call and then fails to send its reply.
+
+**What happens with a malformed request?**
+`ERR PROTOCOL` and the connection closes, because after a framing error the server doesn't know where the next
+request starts. The subtle part is closing: if the client has sent more bytes the server hasn't read, a plain
+`close()` sends a TCP reset, and a reset can make the client's read fail before it sees the error. So the server
+half-closes and drains for up to a second (`Server.drain`).
+
+**How does replication work, in one breath?**
+A follower connects and sends `SYNC n`, where n is one past its store's last sequence number. The leader opens a
+`LogTail` at n over its own log files and streams every record from there, exactly as the log holds it, then waits
+for new writes and streams those, with a heartbeat when idle. The follower checks each record's checksum and
+sequence number, applies batches with `Store.replicate` (the leader's sequence numbers, into its own log), and
+acknowledges each batch. Any break: reconnect and send `SYNC` again from wherever its store got to.
+
+**Why read the log files instead of keeping a queue of recent writes in memory?**
+Because then a follower that's an hour behind, one that just restarted, and one that's keeping up all take the same
+path: read the files from their position. With a queue (Redis's replication backlog is one) the leader holds memory
+for each slow follower or drops it, a leader restart loses the queue, and catch-up needs a second code path. Here
+the writer never waits for or buffers for a follower; the cost is two positional reads a record through the page
+cache (`LogTail.read`).
+
+**How does the tail know a record is safe to read while the store is writing the same file?**
+It only reads records with sequence numbers up to `store.lastSequence()`, and the store sets that after the append
+has returned. So the record's bytes are already in the file; a write in progress is always past what the tail will
+read. And under `EVERY_WRITE` those records are on the device, so a follower never gets a write the leader could
+lose in a crash (`LogTail` class comment, `Store.appendAndApply`).
+
+**How does it find the record in the files?**
+Logs are in sequence order and each starts where the last ended, so the record is in the last log whose first
+record is at or before it (`LogTail.open`). It skips earlier records by their headers alone, and at the clean end of
+a log it lists the directory again: the record must be in a newer log, because only the newest log takes writes and
+the record is acknowledged. If the store deleted the log mid-read, the tail's open channel still reads it
+(`LogTailTest.aTailKeepsReadingALogTheStoreDeleted`).
+
+**What happens when a follower is too far behind?**
+Flushed logs are deleted unless `Options.retainLogBytes` keeps them (the newest ones, oldest deleted first, so
+what's left is unbroken; `keystore serve` keeps 64 MiB, like Postgres's `wal_keep_size`). If the record the follower
+needs is gone, the tail throws `BehindException`, the leader sends `ERR BEHIND oldest`, and the follower stops in
+state `BEHIND`: it needs a copy of the leader's tables, which day 4's snapshots will provide
+(`ReplicationTest.aFollowerWhoseNextRecordIsGoneStopsAsBehind`).
+
+**Where does a follower keep its position, and what if it crashes?**
+Its position is its own store's `lastSequence()`. Nothing else is stored. After a crash the store recovers like any
+store, and the follower asks for whatever comes after what it recovered, so the position can never disagree with the
+data (`ReplicationTest.aRestartedFollowerCarriesOnFromItsLastSequenceNumber`).
+
+**A follower that forces every write would do about 350 a second here. How does it keep up with a leader doing
+hundreds of thousands?**
+It applies whatever has arrived as one batch (up to 1,024 records or 4 MiB) with one `Store.replicate` call: one
+append loop, one force, one publish (`Follower.stream`, `ReplicateTest.aBatchIsForcedOnce`). It's group commit,
+done on the follower, where the batches form by themselves. README "Results" has the catch-up rate under both sync
+policies.
+
+**How does the leader notice a dead follower, and the follower a dead leader?**
+Heartbeats and acknowledgements. An idle leader sends `HEARTBEAT seq` every second; a follower that hears nothing
+for 10 seconds reconnects. The follower sends `ACK seq` after each batch and heartbeat, and the leader closes a
+stream after ten heartbeats of silence (`Server.readAcks`), which also frees the deleted log a tail might be holding
+open (`ReplicationTest.aFollowerThatStopsAckingIsDropped`).
+
+**Is this replication synchronous? What can a client lose?**
+Asynchronous: the leader acknowledges a write when its own log has it. If the leader's disk dies before a follower
+gets the write, the write is gone. Reads on a follower can be stale by its lag (`info` shows `lag=`). There's no
+failover. Semi-synchronous replication would wait for one follower's `ACK` before acknowledging; the ACKs already
+exist for it.
+
+**Can a follower end up with different data than the leader?**
+Under `EVERY_WRITE` on the leader, no: a follower only gets acknowledged, forced records, applied in order with the
+same numbers. Under `NEVER`, a leader crash can lose acknowledged writes a follower already has. If the follower
+reconnects first, it is ahead of the leader and gets `ERR AHEAD` (it stops). If the leader has already taken new
+writes under those numbers, the follower carries on with a different history at them, and nothing notices; the fix
+is to check the checksum of the record before `from` in `SYNC`, as Raft checks the previous entry's term. It's in
+DESIGN.md's limitations.
+
 ## What's next
 
 **What would you build next?**
-The TCP server and replication (day 3); crash tests with a killed process, JMH benchmarks, and moving flushes and
-merges to a background thread with group commit (day 4). For the tables themselves: a block cache, prefix
-compression within blocks, and leveled compaction to compare against size-tiered.
+Crash tests with a killed process, on a leader and a follower; snapshots, which also give a `BEHIND` follower a copy
+of the tables to start from; JMH benchmarks; and moving flushes and merges to a background thread with group commit
+(day 4). For replication: the previous-record check in `SYNC`, and semi-synchronous writes. For the tables
+themselves: a block cache, prefix compression within blocks, and leveled compaction to compare against size-tiered.

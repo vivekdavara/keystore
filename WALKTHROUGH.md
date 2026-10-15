@@ -383,9 +383,9 @@ data (`ReplicationTest.aRestartedFollowerCarriesOnFromItsLastSequenceNumber`).
 **A follower that forces every write would do about 350 a second here. How does it keep up with a leader doing
 hundreds of thousands?**
 It applies whatever has arrived as one batch (up to 1,024 records or 4 MiB) with one `Store.replicate` call: one
-append loop, one force, one publish (`Follower.stream`, `ReplicateTest.aBatchIsForcedOnce`). It's group commit,
-done on the follower, where the batches form by themselves. README "Results" has the catch-up rate under both sync
-policies.
+append loop, one force, one publish (`Follower.stream`, `ReplicateTest.aBatchIsForcedOnce`), split into runs only
+where the leader's log would have flushed. It's group commit, done on the follower, where the batches form by
+themselves. README "Results" has the catch-up rate under both sync policies.
 
 **How does the leader notice a dead follower, and the follower a dead leader?**
 Heartbeats and acknowledgements. An idle leader sends `HEARTBEAT seq` every second; a follower that hears nothing
@@ -398,6 +398,28 @@ Asynchronous: the leader acknowledges a write when its own log has it. If the le
 gets the write, the write is gone. Reads on a follower can be stale by its lag (`info` shows `lag=`). There's no
 failover. Semi-synchronous replication would wait for one follower's `ACK` before acknowledging; the ACKs already
 exist for it.
+
+**Tell me about a bug the review found on day 3.**
+The follower dropped records it had already checked. It collects whatever has arrived into a batch and applies the
+batch once nothing more is waiting. But the leader writes its last records and its `ERR` line in one go, so when a
+stream ended with an error (the leader's next record was damaged, or its store was closing), the follower read the
+error before applying, threw the batch away with the connection, and reconnected. With a damaged record 6, it got
+records 1 to 5 on every connection and never kept them; when a leader's store closed after 2,000 writes, the
+follower had received all 2,000 and kept 1,024. The fix is one rule in `Follower.stream`: whatever ends a stream,
+apply the records that passed their checks first (`review/FollowerKeepsVerifiedRecordsOnStreamErrorTest`).
+
+**What if a catch-up batch is bigger than the room left in the follower's log?**
+That was the second review bug. The leader took those writes one at a time, flushing whenever its log reached 4 MiB,
+so it never came near its log's size limit; the follower put a whole batch in at once and could hit it, and stopped.
+Now `Store.replicate` splits a batch into runs that end where the leader's log would have flushed, with a flush
+between them, so a batch never needs more room than the leader's writes did (`ReplicateTest`).
+
+**How do you know a crashed follower comes back consistent?**
+`FollowerCrashCycleTest` makes a fault land on a random write or force of the follower's store (a batch's append,
+a table, the manifest, a directory) and takes the directory as the crash image. Each image must recover to exactly
+the leader's state at the image's own sequence number, a prefix of the leader's history and never a mix, with
+nothing the follower acknowledged missing, and then follow the leader to the end. Publishing a batch before
+appending it fails it at once.
 
 **Can a follower end up with different data than the leader?**
 Under `EVERY_WRITE` on the leader, no: a follower only gets acknowledged, forced records, applied in order with the

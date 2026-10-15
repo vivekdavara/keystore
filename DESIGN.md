@@ -594,6 +594,9 @@ failed; it takes none until reopened), `BUSY` (too many connections), `BEHIND` a
   starts after it.
 - **Memory is bounded by the connection limit** (256 by default, past which a connection gets `ERR BUSY`): each
   connection holds at most one request's data, at most 16 MiB and a key.
+- **At most 64 refusals at once.** Each `ERR BUSY` drains for up to a second; past 64 at once, a connection is closed
+  without a reply, so a flood can't hold a file descriptor for each connection (the store needs some for its own
+  files).
 
 `keystore serve DIR PORT` runs a leader; `keystore follow DIR PORT LEADER` runs a follower that serves reads;
 `keystore client HOST:PORT put|get|delete|info` sends one request (README, "Run it").
@@ -636,8 +639,9 @@ through the page cache. A tail:
 3. at the clean end of a log, lists the directory again: the record is in a newer log, since only the newest log
    takes writes and the record is acknowledged.
 4. keeps reading a log the store has deleted, through its own open channel.
-5. throws `BehindException` when the record is in a log that's gone, and treats a record that fails its checks as an
-   error, never as data.
+5. throws `BehindException` when the record is in a log that's gone, and treats a record that fails its checks, a
+   record out of sequence, or a skip that lands past the end of the log (a damaged length) as damage: an error,
+   never data, and never mistaken for `BEHIND`.
 
 It waits for new writes with `Store.awaitSequence`, a `ReentrantLock` and `Condition` (in Java 21 a virtual thread
 blocked in `Object.wait` pins its carrier thread) that a write signals only when someone is waiting: the waiter
@@ -656,13 +660,28 @@ writes: there is no separate position file to get out of step with the data.
 
 **A batch is whatever has arrived**, up to 1,024 records or 4 MiB, applied in one `replicate` call: under
 `EVERY_WRITE` one force a batch, not a record. That is group commit for replication, and it is what lets a follower
-that forces keep up with a leader that doesn't (README, "Results").
+that forces keep up with a leader that doesn't (README, "Results"). Two rules from the review:
+
+- **A batch goes into the log in runs** that end where the leader's log would have reached `flushLogBytes`, with a
+  flush before each run that finds the log full enough, as the leader flushed between the same writes. So a batch
+  never needs more room in a log than the leader's writes did. In one piece, a 12 KiB catch-up batch failed with
+  `LogFullException` on a follower with its leader's options (flush at 1 KiB, cap at 4 KiB), and it stopped.
+- **Whatever ends a stream, the records already in the batch are applied first.** Each passed its checks; only
+  then does the follower reconnect. Dropping them with the connection meant a follower whose leader's next record
+  was damaged received the good records before it on every connection and never kept them, and the last writes a
+  leader sent before its store closed were lost from the follower.
 
 **Heartbeats and acknowledgements.** An idle stream carries `HEARTBEAT seq` (the leader's last sequence number)
 every second, so the follower knows its lag and notices a dead leader (no line for 10 seconds: reconnect). The
 follower sends `ACK seq` after each batch and heartbeat; the leader shows each follower's sent and acknowledged
 positions (`Server.followers()`, `INFO`), and closes a stream after ten heartbeats with no ACK, so a follower that
 vanished without closing its end doesn't keep a stream, and a deleted log's disk space, held for good.
+
+**A stream waits in slices of 50 ms.** Its wait for the next write is `Store.awaitSequence`, which only a write or
+the store's close wakes: not the server closing, nor the ACK reader closing the socket. So it waits at most 50 ms
+at a time and looks at both between waits, sending a heartbeat once a whole heartbeat has passed with nothing sent.
+Without the slices (the review), `Server.close()` waited out an idle stream's heartbeat, 5 s with a 30-second one,
+and returned with the stream still running.
 
 **Replication is asynchronous.** The leader acknowledges a write when its own log has it; a follower may not have
 it yet, and a follower's reads may be stale by its lag. There is no failover: a follower never becomes a leader.
@@ -782,6 +801,27 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
   compares every key of the two stores and their sequence numbers.
 - **End to end** (`MainTest`, and `scripts/replication-demo.sh` in CI): `keystore serve`, `follow` and `client`, a
   write read back from the follower, and both processes stopped by SIGTERM with their stores closed.
+- **A follower crashed anywhere** (`FollowerCrashCycleTest`): the follower's store gets `TableCrashCycleTest`'s
+  countdown of writes and forces, so a fault lands on a batch's append, a flush's table, the manifest or a directory
+  force. Each image is recovered and must be exactly the leader's state at the image's own sequence number, with
+  nothing the follower acknowledged missing; then it follows on. Two seeds of 40 cycles: 56 crashes, faults on every
+  kind of step; whole records of a batch whose append failed partway are recovered too (98 of them), which is still a
+  prefix.
+- **A scripted leader** (`FollowerStreamTest`) sends a gap, a repeat, a damaged record, a burst cut short, records in
+  the same burst as `ERR INTERNAL` and `ERR BEHIND`, and lines that aren't a stream: the follower applies exactly the
+  records that passed their checks, never one that didn't, and asks again from its store's position.
+- **The review's tests** (`review/`): a follower keeping the records before a damaged one and before its leader's
+  store closed; a catch-up batch bigger than a log's room; `Server.close()` with an idle stream.
+- **Do the tests fail when they should?** Removed or changed in a copy, restored after: a batch published before it
+  is appended (the crash test: acknowledged, then lost), the follower's sequence check (three `FollowerStreamTest`
+  tests: it stops as `FAILED` instead of reconnecting), the tail's gap check (it returned record 6 for 5), the
+  past-the-end check (the tail said `BEHIND`), the refusal cap (150 replies in a flood instead of at most 64), the
+  ACK timeout, the tail's checksum check, and the ship loop's flush before waiting (the review checked the last two).
+- **What the tests can't show.** The drain after `ERR PROTOCOL`: on this Mac's loopback a reply survived without it,
+  in the test and in 50 tries with 200 KiB unread behind the bad line, so no test fails when it is removed; it stays
+  because a reset can discard data in flight on other stacks, and costs nothing. Two race-only paths are untested:
+  the acceptor's second look at `closing` (a connection accepted while `close()` runs) and a tail skipping a log
+  deleted between its listing and its open.
 
 ## Plan for days 3–5
 
@@ -843,3 +883,8 @@ Day 3's:
   reading) until ten heartbeats pass without an ACK.
 - **Each record costs the leader two positional reads**, and the follower one decode and one copy into its own log.
   Followers can't serve `SYNC` (no chains of followers).
+- **An `OutOfMemoryError` while encoding a write fails the store** like any error in the write path, though nothing
+  was written yet. Many connections each sending a 16 MiB value at once could cause one (a connection waiting for the
+  write lock holds its value twice: as read, and the store's copy); the connection limit bounds it.
+- **A follower's options must allow its leader's writes**: a follower whose `maxLogBytes` is smaller than a single
+  record its leader took stops as `FAILED`.

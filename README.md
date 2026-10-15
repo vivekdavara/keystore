@@ -188,6 +188,9 @@ CI runs it on Linux and macOS.
 | A tail reads every record in order across logs, follows a writer through 20,000 writes, flushes and merges, reads on through a deleted log, says `BEHIND` when a log is gone, and never returns a damaged record | `LogTailTest` |
 | A follower gets every write live, catches up late, after its own restart, after a broken connection and after the leader's restart; `BEHIND` and `AHEAD` stop it; a silent follower is dropped; every key compared | `ReplicationTest` |
 | `keystore serve`, `follow` and `client` end to end | `MainTest`, `scripts/replication-demo.sh` |
+| A follower crashed at any write or force (80 cycles, 56 crashes) recovers to exactly its leader's state at its own sequence number, then follows on | `FollowerCrashCycleTest` |
+| A scripted leader sends gaps, repeats, damaged records and junk: the follower applies only what passed its checks and asks again from its position | `FollowerStreamTest` |
+| The review's three bugs, as tests that failed before the fixes | `review/` |
 
 Most of the mechanisms these tests cover were also checked the other way round: removed in a copy of the file, a
 test had to fail, and the file was restored. DESIGN.md, "Testing", lists which.
@@ -352,6 +355,36 @@ writes. Nothing acknowledged was lost and the manifest never named a missing tab
   then delete files the manifest on disk still names), `compactAll` not failing the store, `flush` and `compactAll`
   running after a failure, and a failed flush taken for a failed per-write force (close then skips a force it needs
   under `NEVER`).
+
+## Review of day 3
+
+One review agent (the account's usage limit stopped two on day 2) started on the day's code at `3195c23`, in its own
+git worktree, worded as a correctness review of the server, the tail, the follower and `Store.replicate`, for about
+20 minutes. It reported three bugs, each with a test that failed; I reproduced each in the repo before fixing it, and
+its tests are in `review/`:
+
+- **The follower dropped records it had checked when a stream ended with an error.** It applied its batch only when
+  the batch was full, at a heartbeat, at `ERR BEHIND`, or when nothing more had arrived; the leader writes its last
+  records and an `ERR` line together, so any other end threw the batch away. A leader whose next record was damaged
+  sent records 1 to 5 on every connection and the follower never kept them (0 applied after 4 connects); when a
+  leader's store closed after 2,000 writes, the follower had received all of them and applied 1,024. Now whatever
+  ends a stream, the records already checked are applied first.
+- **A follower with its leader's options failed during catch-up.** `replicate` put a whole batch into the log at
+  once; the leader had taken the same writes one at a time, flushing between them. With a flush at 1 KiB and a cap of
+  4 KiB, the leader took 300 writes and the follower stopped on a 12 KiB batch with `LogFullException`. Batches now
+  go in runs that end where the leader's log would have flushed.
+- **`Server.close()` couldn't end an idle `SYNC` stream**: the stream waited for a write, which closing a socket
+  doesn't wake, so close waited 5 s and returned with the stream still running. Streams now wait in 50 ms slices.
+
+From its suspicions, I fixed three more: a flood of refused connections held a socket each for up to a second (now
+at most 64 at once); a tail mistook a damaged length in a record it skipped for the end of the log and said `BEHIND`
+(reproduced; now damage); a tail leaked a channel when reading a log's first record failed. It also listed mechanisms
+no test caught when removed; the follower's sequence check, the tail's gap check, and applying the batch before
+stopping on `BEHIND` now have tests (`FollowerStreamTest`, `LogTailTest`), and the drain after a protocol error is
+in DESIGN.md's "What the tests can't show": on this Mac nothing fails without it.
+
+While it ran I added `FollowerCrashCycleTest` (a follower crashed at any write or force recovers to a prefix of its
+leader's history) and `FollowerStreamTest` (a scripted leader that sends gaps, repeats and damage).
 
 ## Design decisions
 

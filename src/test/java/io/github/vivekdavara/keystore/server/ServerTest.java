@@ -179,6 +179,54 @@ class ServerTest {
     }
 
     @Test
+    void aFloodOfRefusedConnectionsHoldsAtMost64AtOnce() throws Exception {
+        Store store = store(Options.defaults().withSync(SyncPolicy.NEVER));
+        Server server = track(Server.leader(store, Server.Config.loopback(0).withMaxConnections(1)));
+        Client holder = client(server);
+        holder.ping(); // takes the one slot
+        List<Socket> flood = new ArrayList<>();
+        try {
+            long start = System.nanoTime();
+            for (int i = 0; i < 150; i++) {
+                Socket socket = new Socket();
+                flood.add(socket);
+                socket.connect(server.address(), 5_000);
+                socket.setSoTimeout(5_000);
+            }
+            long floodMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            int busy = 0;
+            int closedWithoutReply = 0;
+            for (Socket socket : flood) {
+                String line;
+                try {
+                    line = Protocol.readLine(new BufferedInputStream(socket.getInputStream()));
+                } catch (IOException e) {
+                    line = null; // reset
+                }
+                if (line != null && line.startsWith("ERR BUSY ")) {
+                    busy++;
+                } else {
+                    assertTrue(line == null, line);
+                    closedWithoutReply++;
+                }
+            }
+            assertEquals(150, busy + closedWithoutReply);
+            assertTrue(busy >= 1, "some were told");
+            if (floodMillis < 900) { // each refusal holds its socket for up to a second, so the cap holds within one
+                assertTrue(busy <= 64, busy + " refused with a reply at once, in " + floodMillis + " ms");
+                assertTrue(closedWithoutReply >= 150 - 64, closedWithoutReply + " closed at once");
+            }
+        } finally {
+            for (Socket socket : flood) {
+                socket.close();
+            }
+        }
+        holder.close();
+        awaitConnections(server, 0);
+        client(server).ping(); // the server still serves
+    }
+
+    @Test
     void concurrentClientsGetDistinctSequenceNumbers() throws Exception {
         Store store = store(Options.defaults().withSync(SyncPolicy.NEVER).withFlushLogBytes(64 << 10));
         Server server = leader(store);

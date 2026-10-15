@@ -95,12 +95,16 @@ public final class Server implements Closeable {
     /** The longest a stream waits for a write before it looks at whether it should stop. */
     private static final long WAIT_SLICE_NANOS = TimeUnit.MILLISECONDS.toNanos(50);
 
+    /** Connections being refused at once; past this, a refused connection is closed without a reply. */
+    private static final int MAX_REFUSALS = 64;
+
     private final Store store;
     private final Role role;
     private final Config config;
     private final Supplier<String> status;
     private final ServerSocket listener;
     private final Semaphore slots;
+    private final Semaphore refusals = new Semaphore(MAX_REFUSALS);
     private final Set<Socket> connections = ConcurrentHashMap.newKeySet();
     private final Set<Thread> handlers = ConcurrentHashMap.newKeySet();
     private final Map<Socket, FollowerConnection> followers = new ConcurrentHashMap<>();
@@ -219,8 +223,17 @@ public final class Server implements Closeable {
         }
     }
 
-    /** Answers {@code ERR BUSY} and closes, on a thread of its own so the acceptor never waits on a client. */
+    /**
+     * Answers {@code ERR BUSY} and closes, on a thread of its own so the acceptor never waits on a
+     * client. At most {@link #MAX_REFUSALS} at once (each can hold its socket for a second, draining):
+     * past that, a flood of connections is closed without a reply rather than holding a file
+     * descriptor each, which the store needs for its own files.
+     */
     private void refuse(Socket socket) {
+        if (!refusals.tryAcquire()) {
+            closeQuietly(socket);
+            return;
+        }
         Thread.ofVirtual().name("keystore-refuse").start(() -> {
             try (socket) {
                 OutputStream out = socket.getOutputStream();
@@ -229,6 +242,8 @@ public final class Server implements Closeable {
                 drain(socket);
             } catch (IOException ignored) {
                 // The client went first.
+            } finally {
+                refusals.release();
             }
         });
     }

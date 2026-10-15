@@ -6,6 +6,9 @@ import io.github.vivekdavara.keystore.Store;
 import io.github.vivekdavara.keystore.SyncPolicy;
 import io.github.vivekdavara.keystore.memtable.MemTable;
 import io.github.vivekdavara.keystore.memtable.SkipList;
+import io.github.vivekdavara.keystore.server.Client;
+import io.github.vivekdavara.keystore.server.Follower;
+import io.github.vivekdavara.keystore.server.Server;
 import io.github.vivekdavara.keystore.wal.RecoveryMode;
 import io.github.vivekdavara.keystore.wal.WalFormat;
 import io.github.vivekdavara.keystore.wal.WalReader;
@@ -15,10 +18,14 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.List;
 import java.util.SplittableRandom;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.stream.Stream;
@@ -38,6 +45,13 @@ import java.util.stream.Stream;
  * scan TAIL_BYTES zeros|random    time to read a log of one record and a damaged tail
  * memory COUNT VALUE_BYTES        heap bytes per key in a memtable, against approximateBytes
  * skiplist COUNT                  inserts and lookups: this skip list against ConcurrentSkipListMap
+ * server CONNECTIONS COUNT VALUE_BYTES
+ *                                 COUNT puts then COUNT gets over loopback TCP, one request at a time
+ *                                 on each of CONNECTIONS connections, to a leader under NEVER
+ * catchup COUNT VALUE_BYTES SYNC  a new follower (its store under SYNC) catching up on a leader that
+ *                                 holds COUNT puts: time, records/s, batches
+ * lag COUNT VALUE_BYTES SYNC      one put at a time to a leader, timed until a follower (under SYNC)
+ *                                 has applied it
  * </pre>
  */
 public final class Bench {
@@ -52,6 +66,9 @@ public final class Bench {
             case "scan" -> scan(Integer.parseInt(args[1]), args[2]);
             case "memory" -> memory(Integer.parseInt(args[1]), Integer.parseInt(args[2]));
             case "skiplist" -> skiplist(Integer.parseInt(args[1]));
+            case "server" -> server(Integer.parseInt(args[1]), Integer.parseInt(args[2]), Integer.parseInt(args[3]));
+            case "catchup" -> catchup(Integer.parseInt(args[1]), Integer.parseInt(args[2]), SyncPolicy.valueOf(args[3]));
+            case "lag" -> lag(Integer.parseInt(args[1]), Integer.parseInt(args[2]), SyncPolicy.valueOf(args[3]));
             default -> throw new IllegalArgumentException("unknown benchmark " + args[0]);
         }
     }
@@ -320,6 +337,168 @@ public final class Bench {
                     System.out.printf("skiplist %s count=%d: %.0f inserts/s, %.0f lookups/s%n",
                             which, count, count / seconds(t0, t1), count / seconds(t1, t2));
                 }
+            }
+        }
+    }
+
+    /** One request on a client, for key number {@code i}. */
+    private interface Request {
+        void send(Client client, int i) throws IOException;
+    }
+
+    /**
+     * The server's cost on loopback: a leader whose store doesn't force (NEVER), so a put's time is
+     * the round trip, the server's parsing and the in-memory write. Each connection is a thread
+     * sending one request and waiting for its reply; latency is that round trip.
+     */
+    private static void server(int connections, int count, int valueBytes) throws Exception {
+        byte[] value = randomBytes(valueBytes, 11);
+        for (int run = 0; run < 2; run++) { // run 0 warms up
+            Path dir = Files.createTempDirectory("keystore-bench");
+            try (Store store = Store.open(dir, Options.defaults().withSync(SyncPolicy.NEVER));
+                    Server server = Server.leader(store, Server.Config.loopback(0))) {
+                long[] puts = new long[count];
+                long[] gets = new long[count];
+                long putNanos = clients(server, connections, count, (client, i) -> client.put(key(i), value), puts);
+                long getNanos = clients(server, connections, count, (client, i) -> {
+                    if (client.get(key(i)).isEmpty()) {
+                        throw new AssertionError("key " + i + " missing");
+                    }
+                }, gets);
+                if (run == 1) {
+                    Arrays.sort(puts);
+                    Arrays.sort(gets);
+                    System.out.printf("server connections=%d count=%d value=%dB: puts %.0f/s, p50 %.1f us, p99 %.1f us;"
+                                    + " gets %.0f/s, p50 %.1f us, p99 %.1f us%n",
+                            connections, count, valueBytes, count / (putNanos / 1e9), micros(puts[count / 2]),
+                            micros(puts[(int) (count * 0.99)]), count / (getNanos / 1e9), micros(gets[count / 2]),
+                            micros(gets[(int) (count * 0.99)]));
+                }
+            } finally {
+                delete(dir);
+            }
+        }
+    }
+
+    /** Runs {@code count} requests split over {@code connections} threads; returns the wall time. */
+    private static long clients(Server server, int connections, int count, Request request, long[] latencies)
+            throws Exception {
+        int each = count / connections;
+        CountDownLatch go = new CountDownLatch(1);
+        List<Thread> threads = new ArrayList<>();
+        List<Throwable> failures = new ArrayList<>();
+        for (int c = 0; c < connections; c++) {
+            int first = c * each;
+            int last = c == connections - 1 ? count : first + each;
+            Thread t = new Thread(() -> {
+                try (Client client = Client.connect(server.address())) {
+                    go.await();
+                    for (int i = first; i < last; i++) {
+                        long t0 = System.nanoTime();
+                        request.send(client, i);
+                        latencies[i] = System.nanoTime() - t0;
+                    }
+                } catch (Throwable e) {
+                    synchronized (failures) {
+                        failures.add(e);
+                    }
+                }
+            });
+            t.start();
+            threads.add(t);
+        }
+        Thread.sleep(100); // let every client connect before the clock starts
+        long start = System.nanoTime();
+        go.countDown();
+        for (Thread t : threads) {
+            t.join();
+        }
+        long end = System.nanoTime();
+        if (!failures.isEmpty()) {
+            throw new AssertionError("a client failed", failures.get(0));
+        }
+        return end - start;
+    }
+
+    /**
+     * A leader holding COUNT puts (in tables by now, every log kept), then a new follower whose
+     * store forces under SYNC: the time until it has applied them all.
+     */
+    private static void catchup(int count, int valueBytes, SyncPolicy sync) throws Exception {
+        byte[] value = randomBytes(valueBytes, 12);
+        for (int run = 0; run < 2; run++) { // run 0 warms up
+            Path leaderDir = Files.createTempDirectory("keystore-bench");
+            Path followerDir = Files.createTempDirectory("keystore-bench");
+            try (Store leader = Store.open(leaderDir,
+                            Options.defaults().withSync(SyncPolicy.NEVER).withRetainLogBytes(Long.MAX_VALUE));
+                    Server server = Server.leader(leader, Server.Config.loopback(0))) {
+                for (int i = 0; i < count; i++) {
+                    leader.put(key(i), value);
+                }
+                long logBytes = 0;
+                try (Stream<Path> files = Files.list(leaderDir)) {
+                    for (Path f : files.filter(f -> f.toString().endsWith(".log")).toList()) {
+                        logBytes += Files.size(f);
+                    }
+                }
+                try (Store store = Store.open(followerDir, Options.defaults().withSync(sync))) {
+                    long t0 = System.nanoTime();
+                    try (Follower follower = Follower.start(store, Follower.Config.of(server.address()))) {
+                        if (!follower.awaitApplied(count, Duration.ofMinutes(10))) {
+                            throw new AssertionError("caught up to " + follower.status());
+                        }
+                        long t1 = System.nanoTime();
+                        Follower.Status status = follower.status();
+                        if (run == 1) {
+                            double s = seconds(t0, t1);
+                            System.out.printf("catchup count=%d value=%dB sync=%s: %.0f ms, %.0f records/s, %.0f MB/s"
+                                            + " of log, %d batches (%.0f records a batch), follower flushes %d%n",
+                                    count, valueBytes, sync, s * 1e3, count / s, logBytes / 1e6 / s, status.batches(),
+                                    (double) count / status.batches(), store.stats().flushes());
+                        }
+                    }
+                }
+            } finally {
+                delete(leaderDir);
+                delete(followerDir);
+            }
+        }
+    }
+
+    /**
+     * One put at a time to a leader (in process, NEVER, so the leader's own force isn't counted),
+     * each timed from the put's return until a follower whose store forces under SYNC has applied
+     * it: what replication adds (the leader's tail waking, the read of its log, TCP, the follower's
+     * checks and append, and its force under EVERY_WRITE).
+     */
+    private static void lag(int count, int valueBytes, SyncPolicy sync) throws Exception {
+        byte[] value = randomBytes(valueBytes, 13);
+        for (int run = 0; run < 2; run++) { // run 0 warms up
+            Path leaderDir = Files.createTempDirectory("keystore-bench");
+            Path followerDir = Files.createTempDirectory("keystore-bench");
+            try (Store leader = Store.open(leaderDir,
+                            Options.defaults().withSync(SyncPolicy.NEVER).withRetainLogBytes(64L << 20));
+                    Server server = Server.leader(leader, Server.Config.loopback(0));
+                    Store store = Store.open(followerDir, Options.defaults().withSync(sync));
+                    Follower follower = Follower.start(store, Follower.Config.of(server.address()))) {
+                long[] latencies = new long[count];
+                for (int i = 0; i < count; i++) {
+                    long seq = leader.put(key(i), value);
+                    long t0 = System.nanoTime();
+                    if (!follower.awaitApplied(seq, Duration.ofSeconds(30))) {
+                        throw new AssertionError("not applied: " + follower.status());
+                    }
+                    latencies[i] = System.nanoTime() - t0;
+                }
+                if (run == 1) {
+                    Arrays.sort(latencies);
+                    System.out.printf("lag count=%d value=%dB sync=%s: p50 %.1f us, p99 %.1f us, max %.1f us%n",
+                            count, valueBytes, sync, micros(latencies[count / 2]), micros(latencies[(int) (count * 0.99)]),
+                            micros(latencies[count - 1]));
+                }
+            } finally {
+                delete(leaderDir);
+                delete(followerDir);
             }
         }
     }

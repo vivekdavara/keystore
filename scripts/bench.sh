@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The measurements in the README. Usage: scripts/bench.sh [runs] [day]   (default 5 runs of each, both days)
+# The measurements in the README. Usage: scripts/bench.sh [runs] [day]   (default 5 runs of each, every day)
 # Each line is one run (after a warm-up run inside the JVM); the README reports medians.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -15,6 +15,18 @@ cc -O2 -o target/fsync_cost scripts/fsync_cost.c
 for _ in $(seq "$runs"); do target/fsync_cost target 1000; done
 
 day="${2:-all}"
+if [ "$day" = all ] || [ "$day" = 3 ]; then
+    # Day 3: the server over loopback TCP, a follower catching up, and one write's replication lag.
+    for connections in 1 4 16; do
+        for _ in $(seq "$runs"); do bench server "$connections" 100000 100; done
+    done
+    for sync in NEVER EVERY_WRITE; do
+        for _ in $(seq "$runs"); do bench catchup 1000000 100 "$sync"; done
+    done
+    for _ in $(seq "$runs"); do bench lag 10000 100 NEVER; done
+    for _ in $(seq "$runs"); do bench lag 1000 100 EVERY_WRITE; done
+    [ "$day" = 3 ] && exit 0
+fi
 if [ "$day" = all ] || [ "$day" = 2 ]; then
     # Day 2: flushes, merges and reads from tables.
     for _ in $(seq "$runs"); do bench fill 1000000 100; done

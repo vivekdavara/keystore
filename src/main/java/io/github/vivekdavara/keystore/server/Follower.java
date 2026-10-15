@@ -59,9 +59,10 @@ public final class Follower implements Closeable {
      * @param applied its store's last sequence number
      * @param leader the leader's last sequence number, as of its latest record or heartbeat (0 before any)
      * @param connects connections made to the leader so far
+     * @param batches batches applied so far (each one call to {@link Store#replicate}, one force)
      * @param detail why it last disconnected or stopped, or empty
      */
-    public record Status(State state, long applied, long leader, long connects, String detail) {
+    public record Status(State state, long applied, long leader, long connects, long batches, String detail) {
         /** How many writes the leader had that this store didn't, as of the last news from the leader. */
         public long lag() {
             return Math.max(0, leader - applied);
@@ -117,6 +118,7 @@ public final class Follower implements Closeable {
     private volatile State state = State.CONNECTING;
     private volatile long leaderSequence;
     private volatile long connects;
+    private volatile long batches; // written only by the follower's thread
     private volatile String detail = "";
 
     private Follower(Store store, Config config) {
@@ -133,7 +135,7 @@ public final class Follower implements Closeable {
     }
 
     public Status status() {
-        return new Status(state, store.lastSequence(), leaderSequence, connects, detail);
+        return new Status(state, store.lastSequence(), leaderSequence, connects, batches, detail);
     }
 
     /** {@link #status()} as {@code INFO} words. */
@@ -260,6 +262,7 @@ public final class Follower implements Closeable {
         try {
             store.replicate(batch);
             batch.clear();
+            batches++;
             return true;
         } catch (IOException | RuntimeException e) {
             detail = "the store refused the leader's writes: " + e;

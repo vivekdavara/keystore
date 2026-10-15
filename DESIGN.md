@@ -9,9 +9,11 @@ It is a learning-sized system that tries to be exact about the parts that are ha
 promises, what a crash can leave on disk, and what recovery does with it.
 
 This document is the plan for all five days and the detail for what exists. Day 1 built the memtable, the
-write-ahead log and recovery, and `put`/`get`/`delete` on top of them. Day 2 (this version) adds the rest of the LSM
-tree: tables (SSTables) with a sparse index and a Bloom filter, the flush that writes them, a manifest, reads across
-the memtable and the tables, and size-tiered compaction.
+write-ahead log and recovery, and `put`/`get`/`delete` on top of them. Day 2 added the rest of the LSM tree: tables
+(SSTables) with a sparse index and a Bloom filter, the flush that writes them, a manifest, reads across the memtable
+and the tables, and size-tiered compaction. Day 3 (this version) adds a TCP server with a small text protocol, and
+leader-follower replication: the leader ships its log records, read from its own log files, and a follower applies
+them with the leader's sequence numbers and catches up from its own last one after any break.
 
 ## Contents
 
@@ -28,6 +30,8 @@ the memtable and the tables, and size-tiered compaction.
 - [Compaction (day 2)](#compaction-day-2)
 - [Recovery](#recovery)
 - [Failures while running](#failures-while-running)
+- [The server (day 3)](#the-server-day-3)
+- [Replication (day 3)](#replication-day-3)
 - [Testing](#testing)
 - [Plan for days 3–5](#plan-for-days-35)
 - [Limitations](#limitations)
@@ -40,8 +44,8 @@ the memtable and the tables, and size-tiered compaction.
   before every longer key it is a prefix of. This is LevelDB's default comparator, and the tables (day 2) and
   range scans depend on it.
 - **Every write has a sequence number**, a `long` starting at 1 and increasing by exactly one per write. The log
-  records it, recovery checks the sequence has no gaps, and replication (day 3) will use it to say how far a follower
-  has got.
+  records it, recovery checks the sequence has no gaps, and replication (day 3) uses it to say how far a follower
+  has got: a follower applies the leader's writes under the leader's numbers.
 - **A delete is a write.** It stores a tombstone, a marker that says "no value as of this sequence number". It
   hides older values of the key in the memtable and in older tables, so it is kept, through flushes and merges,
   until a merge reaches the oldest table, where nothing older is left for it to hide (see "Compaction").
@@ -59,11 +63,13 @@ flowchart LR
     sst -->|"size-tiered merge"| sst
     sst -.->|"named by"| manifest[(MANIFEST)]
     client -->|"then frozen, then tables newest first"| sst
-    tcp[TCP server, day 3] -.-> store
-    wal -. "WAL shipping (day 3)" .-> follower[follower Store]
+    tcp[TCP server<br/>a virtual thread a connection] --> store
+    wal -->|"LogTail: SYNC stream of log records"| follower[Follower<br/>Store.replicate, own log and tables]
+    follower -. "ACK seq" .-> tcp
 ```
 
-Solid lines exist (day 2); dotted ones are the plan, except the manifest's, which is a reference, not a data flow.
+The dotted lines are references, not data flows: the manifest names the tables, and a follower's ACKs tell the
+leader how far it has got.
 
 A store directory holds:
 
@@ -71,7 +77,7 @@ A store directory holds:
 |---|---|
 | `LOCK` | Locked with `FileChannel.tryLock()` while a `Store` is open, so two processes (or two `Store`s in one process) never append to the same log. |
 | `MANIFEST` | The live tables, newest first, the oldest log recovery must replay, and the next file number. The only file that says what the others mean. |
-| `NNNNNN.log` | Write-ahead logs, one record per write. Only the newest takes writes; an older one exists only until the table holding its writes is in the manifest. |
+| `NNNNNN.log` | Write-ahead logs, one record per write. Only the newest takes writes; an older one exists only until the table holding its writes is in the manifest, unless `Options.retainLogBytes` keeps it for followers (day 3). |
 | `NNNNNN.sst` | Tables: sorted, immutable, each holding a contiguous range of sequence numbers. |
 | `MANIFEST.tmp` | A manifest being written; renamed over `MANIFEST` when complete. |
 
@@ -407,8 +413,9 @@ and merges another 2.22, 3.37 in all, on top of the log itself, the same in ever
    torn tail there is damage, and the open is refused in either recovery mode. The newest log is recovered as day 1
    recovered its one log (below), torn tail and all.
 4. Only then delete what the manifest doesn't account for: logs below its log number (their writes are in tables),
-   tables it doesn't list (an unfinished flush's, or a merge's inputs), and `MANIFEST.tmp`. A refused open changes
-   nothing.
+   except the newest of them that `Options.retainLogBytes` keeps for followers (day 3); tables it doesn't list (an
+   unfinished flush's, or a merge's inputs); and `MANIFEST.tmp`. A refused open changes nothing. Kept logs are
+   never replayed: the tables cover them.
 
 Normally there is one log to replay. There are two after a crash during a flush, before the manifest named the new
 table: the old log and the new one.
@@ -546,9 +553,134 @@ is intact but in the wrong place (old bytes left beyond a truncation, say); the 
 with its offset, and says what recovery would do. For a log the default refuses, it lists the intact records after
 the damage, which `POINT_IN_TIME` would drop, so the operator can decide with the facts in front of them.
 
+## The server (day 3)
+
+`Server` serves one store over TCP, on the loopback address by default. A request is one line of printable ASCII,
+at most 128 bytes with its newline, naming a command and the lengths of the binary data that follows the newline;
+a reply is a line too, followed by data when it gives a length (`Protocol`). Lengths before data, as in memcached's
+text protocol: keys and values are any bytes, nothing is escaped, and nothing is scanned for a terminator.
+
+| Request | Reply |
+|---|---|
+| `PING` | `PONG` |
+| `GET klen` `\n` key | `VALUE vlen` `\n` value, or `NOTFOUND` |
+| `PUT klen vlen` `\n` key value | `OK seq`, the write's sequence number |
+| `DEL klen` `\n` key | `OK seq` |
+| `INFO` | `INFO role=leader seq=… connections=… followers=…` (a follower adds its state, its leader's position and its lag) |
+| `SYNC from` | the replication stream (next section); leaders only |
+| anything | `ERR CODE text` |
+
+Error codes: `PROTOCOL` (the request broke the rules; the connection closes), `READONLY` (a write or `SYNC` sent to
+a follower), `FULL` (the log is full; nothing was written and the store goes on), `FAILED` (the store's writes
+failed; it takes none until reopened), `BUSY` (too many connections), `BEHIND` and `AHEAD` (replication), `INTERNAL`
+(anything else: an I/O error, a closed store).
+
+- **Numbers are strict**: decimal digits, no sign, no leading zero, at most 18 digits. Words are separated by one
+  space. Key lengths are 1 to 65,536 and value lengths 0 to 16 MiB, as in the store, and they are checked before
+  anything is allocated: a request claiming a 2 GiB value is refused from its line alone.
+- **A connection is a virtual thread** (Java 21) that reads a request, answers it, and reads the next, so a
+  connection's replies come in its requests' order. A reply is flushed only when no further request is already
+  buffered, so pipelined requests share one write. Reads and writes go straight to the store, which is thread-safe:
+  writes queue on its write lock, reads take no lock.
+- **Handler threads are never interrupted.** An interrupt during a `FileChannel` operation closes the channel
+  (day 2 found this for tables); the store's log channel closing would fail the store. `Server.close()` closes the
+  sockets instead, and a request in progress finishes its store call (its reply then fails, so the client can't
+  know whether the write happened, as after a crash).
+- **After a `PROTOCOL` error the server half-closes and drains** what the client is still sending (for at most a
+  second and a MiB) before closing. Closing a socket with unread bytes in its receive buffer sends a TCP reset, and
+  a reset can make the client's next read fail before it has read the reply in flight. Where the next request
+  would start is unknown after a framing error, so the connection can't go on.
+- **A follower refuses writes after reading their data**: the data is part of the stream, and the next request
+  starts after it.
+- **Memory is bounded by the connection limit** (256 by default, past which a connection gets `ERR BUSY`): each
+  connection holds at most one request's data, at most 16 MiB and a key.
+
+`keystore serve DIR PORT` runs a leader; `keystore follow DIR PORT LEADER` runs a follower that serves reads;
+`keystore client HOST:PORT put|get|delete|info` sends one request (README, "Run it").
+
+## Replication (day 3)
+
+```mermaid
+sequenceDiagram
+    participant F as Follower (store at seq n)
+    participant L as Leader
+    F->>L: SYNC n+1
+    Note over L: LogTail(n+1) over the leader's own log files
+    L->>F: REC len + record n+1, exactly as its log holds it
+    L->>F: REC len + record n+2 ...
+    Note over F: check checksum and sequence number,<br/>Store.replicate(batch): append, one force, apply
+    F->>L: ACK n+2
+    L->>F: HEARTBEAT seq (when idle, every second)
+    F->>L: ACK n+2
+    Note over F,L: connection breaks: reconnect, SYNC lastSequence()+1
+```
+
+**What is shipped is the log.** The leader sends each record as the bytes its log holds, checksum included, so the
+follower checks the checksum of exactly what was written, wherever it was damaged (on the leader's disk, in memory,
+in transit). The follower checks that each record carries the next sequence number, then applies a batch through
+`Store.replicate`, which appends the records to the follower's own log with the leader's sequence numbers, applies
+them to its memtable, and publishes them. The follower then flushes and merges on its own, so its files differ from
+the leader's, but its contents at sequence number n are the leader's at n: the same writes, in the same order.
+
+**The leader reads its log files, not a queue in memory** (`LogTail`). Catching up and following live writes are
+then one code path: a follower that was down for an hour, one that just connected, and one that is keeping up all
+read the same files from their own position. The writer never waits for a follower and holds no buffer for one; a
+slow follower only reads older files. The cost is two positional reads a record (a 16-byte peek, then the record),
+through the page cache. A tail:
+
+1. returns only records the store has acknowledged, `lastSequence()` or below. Those are whole in the log (the
+   append returned before `lastSequence()` moved), so the tail never reads a write in progress, and under
+   `EVERY_WRITE` they are on the device, so a follower never has a write that a crash of the leader could take back.
+2. finds the log holding the record it needs by reading each log's first record: logs are in sequence order, so it
+   is the last log whose first record is at or before it. Earlier records in that log are skipped by their headers.
+3. at the clean end of a log, lists the directory again: the record is in a newer log, since only the newest log
+   takes writes and the record is acknowledged.
+4. keeps reading a log the store has deleted, through its own open channel.
+5. throws `BehindException` when the record is in a log that's gone, and treats a record that fails its checks as an
+   error, never as data.
+
+It waits for new writes with `Store.awaitSequence`, a `ReentrantLock` and `Condition` (in Java 21 a virtual thread
+blocked in `Object.wait` pins its carrier thread) that a write signals only when someone is waiting: the waiter
+counts itself before reading `lastSequence()`, and the writer sets `lastSequence()` before reading the count, so
+either the writer sees the waiter and signals, or the waiter sees the write.
+
+**Logs are kept for followers** by `Options.retainLogBytes`: after a flush, and at an open, the newest covered logs
+are kept until they total at least that many bytes, and older ones are deleted, oldest first, so what's left is
+always an unbroken run of the newest logs. It is Postgres's `wal_keep_size`; `keystore serve` keeps 64 MiB. A
+follower further behind than that gets `ERR BEHIND oldest` and stops: it needs a copy of the leader's tables, which
+is day 4's snapshot.
+
+**A follower's position is its store's `lastSequence()`.** It asks for `SYNC lastSequence()+1` on every connection,
+so after a crash it carries on from whatever its store recovered, and the position is exactly as durable as its
+writes: there is no separate position file to get out of step with the data.
+
+**A batch is whatever has arrived**, up to 1,024 records or 4 MiB, applied in one `replicate` call: under
+`EVERY_WRITE` one force a batch, not a record. That is group commit for replication, and it is what lets a follower
+that forces keep up with a leader that doesn't (README, "Results").
+
+**Heartbeats and acknowledgements.** An idle stream carries `HEARTBEAT seq` (the leader's last sequence number)
+every second, so the follower knows its lag and notices a dead leader (no line for 10 seconds: reconnect). The
+follower sends `ACK seq` after each batch and heartbeat; the leader shows each follower's sent and acknowledged
+positions (`Server.followers()`, `INFO`), and closes a stream after ten heartbeats with no ACK, so a follower that
+vanished without closing its end doesn't keep a stream, and a deleted log's disk space, held for good.
+
+**Replication is asynchronous.** The leader acknowledges a write when its own log has it; a follower may not have
+it yet, and a follower's reads may be stale by its lag. There is no failover: a follower never becomes a leader.
+
+| What happens | What the follower does |
+|---|---|
+| The connection breaks (or the leader closes, or restarts) | Reconnects with backoff (50 ms, doubling to 2 s, reset by progress), asks for `SYNC lastSequence()+1`; a restarted leader serves it from its recovered logs |
+| The follower crashes | Its store recovers like any store; it asks from its recovered `lastSequence()+1` |
+| The record it needs is in a log the leader no longer has | `ERR BEHIND oldest`: stops in state `BEHIND` (it needs a copy of the tables) |
+| It has writes the leader doesn't (a leader that lost acknowledged writes under `NEVER`, or another leader's follower) | `ERR AHEAD last`: stops in state `AHEAD`; streaming would mix two histories |
+| A record fails its checksum or isn't the next sequence number | Drops the connection and reconnects (the leader ends a stream itself if its own log is damaged) |
+| Its store fails, or refuses a batch | Stops in state `FAILED`; the store needs reopening |
+| It goes silent | The leader closes the stream after ten heartbeats |
+
 ## Testing
 
-Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, compaction) come after them.
+Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, compaction) come after them, then day
+3's (the server and replication).
 
 - **The skip list against a model.** Seeded random sequences of puts and gets, checked step by step against
   `java.util.TreeMap`, plus the iteration order; with small and large key spaces, and with keys that are prefixes of
@@ -622,15 +754,45 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
   the page cache, as a killed process does; a power loss can also lose writes that weren't forced, and the order of
   forces is what protects against that, which only the counts check.
 
+**Day 3's tests:**
+
+- **The protocol** (`ProtocolTest`): every command; 30 lines that aren't requests (spacing, case, signs, leading
+  zeros, lengths one past each limit, non-ASCII digits); lines at and past 128 bytes; every kind of unprintable byte;
+  error lines that a client can read back.
+- **The server** (`ServerTest`): keys and values of every byte value, the longest key, a 3 MiB value; 2,000
+  pipelined `PUT`/`GET` pairs sent before reading a reply, answered in order; six bad requests, each answered with
+  `ERR PROTOCOL` and a closed connection; a follower refusing writes and keeping the connection; the connection
+  limit; 8 clients writing at once (distinct, ordered sequence numbers, with flushes underneath); `FULL` and a closed
+  store as replies; a client that leaves mid-request writes nothing; close ending connections and leaving the store
+  open.
+- **The store's side** (`ReplicateTest`, `LogRetentionTest`): `replicate` with the leader's numbers, through a
+  reopen; gaps, repeats and bad keys write nothing; one force for a batch of 100 under `EVERY_WRITE` (counted); a
+  batch that finds the log full enough flushes first; a batch past the log's limit writes nothing;
+  `awaitSequence`'s timeout, wake-up and close. Retention's arithmetic, then the logs it keeps after flushes and
+  across reopens with a larger and a smaller budget.
+- **The tail** (`LogTailTest`): every record in order across many logs, then waiting; starting at every interesting
+  position; following a writer through 20,000 writes, flushes and merges; `BEHIND` with the oldest record left; a
+  tail reading on through a log the store deleted; records from before a reopen; a flipped byte in a kept log is an
+  error, never data; a closed store's tail fails instead of spinning.
+- **Replication** (`ReplicationTest`): a follower getting every write live; one that starts late and catches up
+  from a leader's logs and tables; one restarted while the leader took 2,000 more writes; a broken connection
+  resumed; a leader restarted from its directory; `BEHIND` and `AHEAD`; reads and refused writes on a follower's
+  server, and the leader's view of its ACKs; 6 clients writing while a follower that forces (`EVERY_WRITE`) keeps
+  up; a follower that never ACKs dropped after ten heartbeats; the raw stream from `SYNC 8` and `ERR AHEAD`. Each
+  compares every key of the two stores and their sequence numbers.
+- **End to end** (`MainTest`, and `scripts/replication-demo.sh` in CI): `keystore serve`, `follow` and `client`, a
+  write read back from the follower, and both processes stopped by SIGTERM with their stores closed.
+
 ## Plan for days 3–5
 
-- **Day 3: the server and replication.** A TCP server with a small line-based text protocol (`PUT`, `GET`, `DEL`,
-  lengths before binary data); leader-follower replication by shipping log records with their sequence numbers;
-  a follower that falls behind catches up from its last applied sequence number.
+- **Day 3 (done): the server and replication.** A TCP server with a small line-based text protocol (`PUT`, `GET`,
+  `DEL`, lengths before binary data); leader-follower replication by shipping log records with their sequence
+  numbers; a follower that falls behind catches up from its last applied sequence number.
 - **Day 4: failure and measurement.** Crash tests that kill a writing process (`kill -9` of a child JVM) and check
-  every acknowledged write; checksum failures in SSTables; snapshots; JMH benchmarks of write and read throughput and
-  of the Bloom filter's effect. Group commit is a candidate optimisation, and moving flushes and merges off the
-  writer's thread (below, "Limitations").
+  every acknowledged write, on a leader and on a follower; checksum failures in SSTables; snapshots, which also give
+  a follower that is `BEHIND` a copy of the leader's tables to start from; JMH benchmarks of write and read
+  throughput and of the Bloom filter's effect. Group commit is a candidate optimisation, and moving flushes and
+  merges off the writer's thread (below, "Limitations").
 - **Day 5:** README with results, WALKTHROUGH.md, v1.0.0.
 
 ## Limitations
@@ -662,3 +824,22 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
 - A value that contains an encoded log record can make recovery refuse to open after an ordinary crash (see "Why
   fail closed by default"). `POINT_IN_TIME` opens it.
 - No snapshots or range scans in the API yet; the memtable and tables can iterate, for the flush and merges.
+
+Day 3's:
+
+- **Replication is asynchronous, with no failover.** A write the leader acknowledged can be on no follower yet; if
+  the leader's disk is lost, so is the write. Nothing promotes a follower. Semi-synchronous replication (waiting for
+  one follower's ACK before acknowledging) would build on the ACKs that exist.
+- **Divergence is caught only when the follower is ahead.** A leader under `NEVER` can lose acknowledged writes in a
+  crash, and a follower may already have them. If the follower asks before the leader has written past it, `AHEAD`
+  stops it; if the leader has since taken new writes under the same sequence numbers, the follower carries on from
+  a history that differs at those numbers, and nothing notices. Checking the checksum of the record before `from`
+  (as Raft checks the previous entry's term) would catch it; under `EVERY_WRITE` it can't happen, since a leader
+  never ships a write it could lose.
+- **A follower `BEHIND` stops** until someone gives it a copy of the leader's tables (day 4's snapshots).
+- **No authentication or TLS**, and the server listens on the loopback address only; `SYNC` hands the whole store to
+  anyone who can connect.
+- **A follower that vanished without closing its end, or stopped reading,** keeps its stream (and the log it is
+  reading) until ten heartbeats pass without an ACK.
+- **Each record costs the leader two positional reads**, and the follower one decode and one copy into its own log.
+  Followers can't serve `SYNC` (no chains of followers).

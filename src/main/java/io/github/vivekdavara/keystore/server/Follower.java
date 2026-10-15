@@ -201,6 +201,22 @@ public final class Follower implements Closeable {
      */
     private State stream(InputStream in, OutputStream out) throws IOException {
         List<WalRecord> batch = new ArrayList<>();
+        try {
+            return follow(in, out, batch);
+        } catch (IOException e) {
+            // Whatever ended the stream (an ERR, a bad record, a broken connection), the records
+            // already in the batch passed their checks: apply them, so the next SYNC asks for less.
+            // Found by review: a leader whose next record was damaged sent the good ones before it
+            // on every connection, and they were dropped every time with the batch, so the follower
+            // never got past them; and the last writes sent before a leader's store closed were lost.
+            if (!apply(batch)) {
+                return State.FAILED;
+            }
+            throw e;
+        }
+    }
+
+    private State follow(InputStream in, OutputStream out, List<WalRecord> batch) throws IOException {
         long batchBytes = 0;
         long expected = store.lastSequence() + 1;
         for (;;) {

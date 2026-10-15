@@ -171,7 +171,7 @@ class FollowerStreamTest {
     }
 
     @Test
-    void aBatchCutShortByABadRecordIsAskedForAgainWhole() throws Exception {
+    void aBurstCutShortByABadRecordKeepsTheGoodRecords() throws Exception {
         startFakeLeader();
         startFollower();
         Connection first = next();
@@ -182,10 +182,39 @@ class FollowerStreamTest {
         first.out().write(burst.toByteArray()); // one write, so they arrive as one batch
         first.out().flush();
         Connection second = next();
-        // Records 1 and 2 were checked, but they were still a batch when the repeat came: the follower
-        // drops the batch with the connection and asks for it again, rather than half-apply a burst.
-        assertEquals("SYNC " + (store.lastSequence() + 1), second.request(), "it asks from exactly where it is");
-        assertTrue(store.lastSequence() <= 2);
+        // Records 1 and 2 passed their checks before the repeat came, still in the batch: they are
+        // applied before the connection is dropped, so the follower asks only for what follows.
+        assertEquals("SYNC 3", second.request());
+        assertEquals(2, store.lastSequence());
+        first.socket().close();
+        second.socket().close();
+    }
+
+    @Test
+    void recordsInTheSameBurstAsAnErrorAreApplied() throws Exception {
+        startFakeLeader();
+        startFollower();
+        Connection first = next();
+        ByteArrayOutputStream burst = new ByteArrayOutputStream();
+        send(burst, record(1));
+        send(burst, record(2));
+        burst.write("ERR INTERNAL the store is closed\n".getBytes(StandardCharsets.US_ASCII));
+        first.out().write(burst.toByteArray());
+        first.out().flush();
+        Connection second = next();
+        assertEquals("SYNC 3", second.request(), "the records before the ERR were applied");
+
+        ByteArrayOutputStream behind = new ByteArrayOutputStream();
+        send(behind, record(3));
+        behind.write("ERR BEHIND 10\n".getBytes(StandardCharsets.US_ASCII));
+        second.out().write(behind.toByteArray());
+        second.out().flush();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (follower.status().state() != Follower.State.BEHIND) {
+            assertTrue(System.nanoTime() < deadline, follower.status().toString());
+            Thread.sleep(1);
+        }
+        assertEquals(3, store.lastSequence(), "and so was the one before BEHIND");
         first.socket().close();
         second.socket().close();
     }

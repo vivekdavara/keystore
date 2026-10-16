@@ -4,14 +4,18 @@ An LSM-tree key-value store in Java 21, built the way LevelDB and RocksDB are: a
 checksums, an in-memory skip list, SSTables with a sparse index and Bloom filters, and size-tiered compaction; a TCP
 server with a small text protocol; and leader-follower replication by shipping the write-ahead log.
 
-**Status: day 3 of 5.** Day 1 built the write path's foundation: the memtable (a hand-written skip list with
+**Status: day 4 of 5.** Day 1 built the write path's foundation: the memtable (a hand-written skip list with
 lock-free reads), the write-ahead log, crash recovery, and `put`/`get`/`delete`. Day 2 made it an LSM tree: the
 memtable is flushed to immutable tables when the log reaches 4 MiB, a manifest names the live tables, reads go
 through the memtable and then the tables newest first, and tables of similar size are merged. Day 3 put it on the
 network: a server (a virtual thread a connection, lengths before binary data), and followers that apply the
 leader's log records under the leader's sequence numbers, read by the leader from its own log files, and catch up
-from their own last sequence number after any break. No external dependencies beyond JUnit.
-[DESIGN.md](DESIGN.md) has the design and the plan for days 4–5.
+from their own last sequence number after any break. Day 4 tested it with real process deaths (a writer, and a
+follower, killed with SIGKILL again and again, every acknowledged write checked), added snapshots (a copy of the
+store as of one sequence number, made of hard links to its tables, which a follower that fell too far behind starts
+again from), `keystore verify` (reads every block, to find damage before a read does), and JMH benchmarks. The store
+depends on nothing; the tests use JUnit, and the benchmarks JMH. [DESIGN.md](DESIGN.md) has the design and the plan
+for day 5.
 
 ## Why
 
@@ -56,7 +60,11 @@ flowchart LR
   follows new writes. The follower checks each record's checksum and sequence number and applies whatever has
   arrived as one batch (one force) into its own log; it acknowledges each batch, and after any break reconnects
   and asks from wherever its store got to. The leader keeps 64 MiB of flushed logs for followers; one further
-  behind is told `BEHIND` and stops (it needs a copy of the tables: day 4).
+  behind is told `BEHIND` and stops, and a snapshot of the leader is a store it can start again from.
+- **Snapshots.** `Store.snapshot(dir)` flushes, pins the current tables, hard-links them (they never change once
+  written) into a new directory beside the target with a manifest naming them, then renames it into place: the
+  target, if it exists, is a whole store holding exactly the writes up to one sequence number. Writes go on while
+  the links are made.
 
 The details, and why each choice was made, are in [DESIGN.md](DESIGN.md).
 
@@ -109,6 +117,37 @@ clean: 25 bytes, every one a good record
 
 For a log the store would refuse to open, it shows where the damage is and lists the intact records after it, the
 ones `RecoveryMode.POINT_IN_TIME` would drop, and exits with status 3.
+
+**Check and copy a store.** `verify` reads every block of every table and every log record, and exits 3 if
+anything is damaged (a store itself reads a table's block only when a read or a merge reaches it). After
+`put target/demo city Boston`, `flush target/demo` and `put target/demo river Charles`:
+
+```bash
+scripts/keystore verify target/demo
+```
+
+prints
+
+```
+000003.sst: ok, 1 entries in 1 blocks, writes #1 to #1
+000002.log: ok, writes #2 to #2
+ok
+```
+
+and a snapshot (the target must not exist):
+
+```bash
+scripts/keystore snapshot target/demo target/demo-snapshot
+```
+
+prints `keystore: snapshot of target/demo at #2 in target/demo-snapshot: 2 tables, 308 bytes, 2 hard-linked`, and
+`get target/demo-snapshot river` prints `Charles`. (`ls -li` shows each table's inode twice, with two links.)
+
+**Benchmarks** (JMH; see "Results"):
+
+```bash
+scripts/jmh.sh
+```
 
 From Java:
 
@@ -191,15 +230,80 @@ CI runs it on Linux and macOS.
 | A follower crashed at any write or force (40 cycles a seed until every kind of step had a fault; 56 crashes in two seeds here) recovers to exactly its leader's state at its own sequence number, then follows on | `FollowerCrashCycleTest` |
 | A scripted leader sends gaps, repeats, damaged records and junk: the follower applies only what passed its checks and asks again from its position | `FollowerStreamTest` |
 | The review's three bugs, as tests that failed before the fixes | `review/` |
+| **Day 4** | |
+| A child JVM writing to a store is killed with SIGKILL, by the test at random moments (20 a sync policy) and by itself at a chosen write or force until deaths have landed on all seven kinds of step (46 and 36 deaths); after each, exactly the writes up to the store's last sequence number, which is the last acknowledged or the one after | `KillTest` |
+| The real `keystore follow` is killed with SIGKILL 12 times, half of them in the middle of catching up on 20,000 to 60,000 writes; each time its store is exactly a prefix of the leader's, at or past every ack the leader saw | `FollowerKillTest` |
+| A snapshot is exactly a prefix, linked or copied; every write and force of one failed in turn leaves nothing; its forces come in order; a merge that replaces its tables mid-copy doesn't hurt it; a `BEHIND` follower starts again from one | `SnapshotTest` |
+| A damaged block fails its read and nothing else; a merge that reaches it stops writes and keeps the manifest; the server's reply says what's wrong; `verify` finds it before any read does | `TableDamageTest`, `MainTest` |
+| The manifest keeps the last write's checksum through flushes and merges; a follower restarted with every write in a table still gets `DIVERGED` from a leader with a different history | `ReplicateTest`, `ReplicationTest`, `ManifestTest` |
 
 Most of the mechanisms these tests cover were also checked the other way round: removed in a copy of the file, a
 test had to fail, and the file was restored. DESIGN.md, "Testing", lists which.
 
 ## Results
 
-These are plain wall-clock timings, not JMH (that's day 4): `scripts/bench.sh` prints one line per run, each run
-after a warm-up run in the same JVM, and each figure below is the median of 5 runs. `Bench` is
+Day 4's numbers are JMH's. Days 1 to 3's are plain wall-clock timings: `scripts/bench.sh` prints one line per run,
+each run after a warm-up run in the same JVM, and each figure is the median of 5 runs. `Bench` is
 `java -cp target/classes:target/test-classes io.github.vivekdavara.keystore.bench.Bench`.
+
+### Day 4: JMH, reads and the Bloom filter
+
+`scripts/jmh.sh` at `80958ce`, 15:39 to 15:42: JMH 1.37, 2 forks, 3 warm-up and 5 measured iterations of 1 s each,
+one thread; ± is JMH's 99.9% confidence interval over the 10 iterations. Apple M3, macOS 26.6.2, the internal SSD,
+OpenJDK 21.0.12, **on battery** (91% to 89%), Low Power Mode off, other apps open (load average about 2.7 before the
+run). Keys are 16 bytes and values 100; the data is synthetic.
+
+`ReadBenchmark` writes 200,000 keys with merges off (14 tables of about 14,000 keys, newest first; the memtable is
+empty) and reads them in a fixed scattered order. Absent keys sort among the present ones, so no table's key range
+rules one out: only the Bloom filters stand between a lookup and a block read in each of the 14 tables. The blocks a
+lookup reads are counted in the benchmark's teardown (warm-up included).
+
+| Bits a key (probes) | Get, absent key | Blocks a lookup | Get, present key | Blocks a lookup |
+|---|---|---|---|---|
+| 1 (1) | 69,409 ± 1,088 /s | 8.840 | 114,188 ± 2,791 /s | 5.280 |
+| 5 (3) | 389,516 ± 3,729 /s | 1.282 | 320,884 ± 13,740 /s | 1.621 |
+| 10 (7), the default | 1,735,369 ± 110,392 /s | 0.114 | 437,185 ± 47,150 /s | 1.056 |
+| 16 (11) | 3,173,820 ± 20,875 /s | 0.007 | 464,668 ± 15,225 /s | 1.003 |
+
+- **The filter is worth 25 times on absent keys** at the default 10 bits (69,409/s → 1,735,369/s), and 46 times at
+  16. A lookup without a useful filter reads a block in nearly every table; at 10 bits, one in nine lookups reads a
+  single block.
+- **The blocks match the formula.** 14 tables times the false-positive rate `(1 - e^(-k/b))^k`: 8.85 at 1 bit
+  (63.2%), 1.29 at 5, 0.115 at 10, 0.006 at 16; measured 8.840, 1.282, 0.114, 0.007.
+- **Present keys gain less** (4 times at 10 bits) because one block read is unavoidable: at 16 bits a lookup reads
+  1.003 blocks, its own and almost never another. With 1 bit, a key in a table halfway down reads blocks in about
+  half the newer tables first: 5.28 a lookup.
+
+`WriteBenchmark`: one thread puts random keys into a store that starts empty for each fork; the iterations go on in
+the same store, so flushes and merges are in the numbers.
+
+| Sync policy | Puts a second | The 10 iterations |
+|---|---|---|
+| `NEVER` | 208,692 ± 109,797 | 102,473 to 288,269 |
+| `EVERY_WRITE` | 339.5 ± 11.4 | 327.5 to 351.4 |
+
+- **Under `NEVER`, the spread is the merges.** An iteration without a large merge puts about 288,000 a second; in
+  each fork the fifth iteration put about 103,000, as the size tiers grow and a merge rewrites more of the store, in
+  the writing thread (DESIGN.md, "Limitations": flushes and merges don't run in the background yet).
+- **Under `EVERY_WRITE`, each put waits for one device flush** (`F_FULLFSYNC`, about 3 ms on this Mac): 339 a
+  second, as day 1's `Bench writes` measured (361).
+
+**The kill tests**, as counts, not timings: the first run of each, at 15:09 and 15:16 at `3088daf` and `b1738fe`
+(`mvn test -Dtest='KillTest,FollowerKillTest'`). The random runs vary from run to run; the chosen steps don't (a
+seed fixes the sequence of file operations), and CI's Ubuntu runner counted the same.
+
+| Test | Deaths | Where they landed |
+|---|---|---|
+| Random moments, `EVERY_WRITE` | 20 | 17 recovered the write in flight, whole (it died forcing it: where a write spends its time); 17 of the 20 left no sign of a flush |
+| Random moments, `NEVER` | 20 | 17 left a flush or a merge half done (a table the manifest doesn't name yet, a manifest half written, two logs), 3 didn't |
+| Chosen steps, `EVERY_WRITE` | 46 | log write 18, log force 19, table write 4, table force 2, manifest write 1, manifest force 1, directory force 1 |
+| Chosen steps, `NEVER` | 36 | log write 15, log force 3, table write 11, table force 3, manifest write 1, manifest force 1, directory force 2 |
+| A follower | 12 | 6 more than 1,000 writes behind its leader, in the middle of catching up (8 in CI's run, and in the review's) |
+
+The random rows read the directory a death left (approximately: a death just after a merge's manifest, with its
+inputs not yet deleted, counts as a table the manifest doesn't name); the chosen steps are the child's own report.
+
+No death lost an acknowledged write, and no store recovered anything but an exact prefix of its writes.
 
 ### Day 3: the server and replication
 
@@ -427,6 +531,31 @@ in DESIGN.md's "What the tests can't show": on this Mac nothing fails without it
 While it ran I added `FollowerCrashCycleTest` (a follower crashed at any write or force recovers to a prefix of its
 leader's history) and `FollowerStreamTest` (a scripted leader that sends gaps, repeats and damage).
 
+## Review of day 4
+
+One review agent started at `0520e30` (the kill tests, the manifest's checksum and the first snapshot code), in its
+own git worktree, worded as a correctness review, for about 13 minutes. It found one bug, with a test that failed; I
+reproduced it on that commit before fixing it:
+
+- **A failed snapshot left its manifest behind, and the directory opened as an empty store.** The cleanup deleted
+  the directory and the tables it had linked, never `MANIFEST.tmp` or `MANIFEST`. A failure at the manifest's force
+  left `MANIFEST.tmp` in the target, so the directory couldn't be deleted, and `Store.open` took it for a new store:
+  it opened, silently, at sequence 0, though the source held 300 writes. A crash had the same hole for a snapshot
+  with no tables. A snapshot is now built in `.TARGET.snapshot-N` beside the target and renamed into place last, and
+  any failure deletes what it built; a test fails each of a snapshot's writes and forces in turn, linked and copied.
+
+Its list of mechanisms no test noticed removed gave four tests: the snapshot's pinned version (a merge replaces every
+table mid-copy; without the pin, "pinned: still there" fails), the order of its forces, the copy path (which had never
+run: linking always works on one file system), and a refused target flushing nothing. Its judgement calls gave two
+fixes: the chosen-step kill test read the child's stderr from the start, so a JVM message such as "Picked up
+JAVA_TOOL_OPTIONS" failed it (reproduced), and the follower kill test now asserts that a catching-up follower got as
+far as it was meant to before dying. It also found DESIGN.md not yet updated, which it now is.
+
+Found while building, before the review: the server's reply to a damaged read was cut at the protocol's 128-byte line
+limit by the table's path, before it said what was wrong (`TableDamageTest`); it now names the file alone. And CI
+failed once on a day-3 test, `FollowerCrashCycleTest` (Ubuntu, run 38954660518): a fault armed for a follower's writes
+wasn't used up when it caught up in fewer, and fired at the cycle's close; the countdown is now disarmed before close.
+
 ## Design decisions
 
 - **A hand-written skip list, one writer, lock-free readers.** Writes are serialised anyway (one log), so the skip
@@ -470,15 +599,27 @@ leader's history) and `FollowerStreamTest` (a scripted leader that sends gaps, r
   forces keeps up with a leader that doesn't.
 - **Virtual threads, never interrupted.** One per connection keeps the server's code straight-line; an interrupt
   would close the store's log channel, so shutdown closes sockets instead.
+- **Kill real processes, and know what they wrote without asking them.** The kill tests' writes are a pure function
+  of a seed and the sequence number, so after a SIGKILL the test can say exactly what the store must hold at
+  whatever sequence number it recovered to; and a child that kills itself at its N-th file operation puts deaths on
+  every kind of step, which random kills mostly don't (most of a write's time is its force).
+- **A snapshot is links to immutable tables, built beside the target and renamed into place.** Tables never change
+  once written, so sharing their inodes is safe and costs nothing per byte; the rename makes the target either a
+  whole snapshot or absent, which a review showed was needed.
+- **The manifest records the last write's checksum**, so a store whose writes are all in tables (after a flush, or a
+  snapshot) can still show a leader where its history ends.
+- **`verify` is a separate full read**, not something `open` does: opening checks what it must to serve reads
+  safely (footers, filters, indexes), and a read checks its block; reading every block on every open would make
+  opening a large store as slow as reading it.
 
 ## Limitations
 
 - Flushes and merges run in the writing thread, under the write lock: the write that triggers one waits for it
-  (reads don't). Background compaction is day 4's, with group commit.
-- Writes are serialised, and under `EVERY_WRITE` each waits for its own device flush; there is no group commit yet.
+  (reads don't), and JMH shows writes slowing as merges grow. Background compaction isn't built.
+- Writes are serialised, and under `EVERY_WRITE` each waits for its own device flush; there is no group commit.
 - A merge takes a whole tier, so it needs as much free space as the tier; tombstones live until a merge reaches the
   oldest table.
-- No block cache, no compression, no range scans or snapshots yet.
+- No block cache, no compression, no range scans.
 - Damage that reaches the end of the log is indistinguishable from a torn write, so it is dropped as one, however
   many records it covers.
 - A value that holds an encoded log record can make recovery refuse to open after an ordinary crash; the default
@@ -487,10 +628,15 @@ leader's history) and `FollowerStreamTest` (a scripted leader that sends gaps, r
   interrupted reader only fails its own read.)
 - Replication is asynchronous, with no failover: a write the leader acknowledged may be on no follower yet, and a
   follower's reads can be stale by its lag (`info` shows it).
-- A follower that falls further behind than the leader's kept logs stops as `BEHIND` until day 4's snapshots.
+- A follower that falls further behind than the leader's kept logs stops as `BEHIND`; it can start again from a
+  snapshot of the leader, but nothing does that for it, and the protocol has no `SNAPSHOT` command: the snapshot is
+  made by the leader's process (`Store.snapshot`), or by `keystore snapshot` while the leader is stopped.
 - A leader under `NEVER` that loses acknowledged writes in a crash and then takes new ones is caught by `SYNC`'s
-  checksum of the follower's last write (`DIVERGED`), but only when the follower still knows that checksum (not
-  after a restart with every write in its tables) and the leader's log still holds that write.
+  checksum of the follower's last write (`DIVERGED`), but only while the leader's log still holds that write.
+- The kill tests keep the page cache, as any process death does, so they can't show a missing force; nothing here
+  pulls the power. A snapshot's links keep a table's space after the store deletes it, and a crash mid-snapshot
+  leaves a `.TARGET.snapshot-N` directory to delete by hand. `verify` takes no lock, so on a running store a merge
+  can make a table it reads go missing.
 - No authentication or TLS; the server listens on the loopback address.
 
 DESIGN.md's "Limitations" has the full list.

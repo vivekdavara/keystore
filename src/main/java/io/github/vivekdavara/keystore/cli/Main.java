@@ -272,7 +272,7 @@ public final class Main {
                     case "snapshot" -> {
                         Store.Snapshot s = store.snapshot(Path.of(args[2]));
                         out.printf("keystore: snapshot of %s at #%d in %s: %d tables, %d bytes, %d hard-linked%n",
-                                store.directory(), s.lastSequence(), s.directory(), s.tables(), s.bytes(), s.linked());
+                                args[1], s.lastSequence(), args[2], s.tables(), s.bytes(), s.linked());
                     }
                     default -> {
                         byte[] key = Bytes.utf8(args[2]);

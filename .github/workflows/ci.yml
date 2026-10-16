@@ -34,6 +34,8 @@ jobs:
           scripts/keystore dump target/ci-store
       - name: Replicate between two packaged servers
         run: scripts/replication-demo.sh
+      - name: JMH benchmarks, one short iteration each (a smoke run, not a measurement)
+        run: scripts/jmh.sh -f 1 -wi 0 -i 1 -r 100ms
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v7

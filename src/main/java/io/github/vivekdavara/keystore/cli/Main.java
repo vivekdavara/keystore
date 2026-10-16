@@ -3,6 +3,7 @@ package io.github.vivekdavara.keystore.cli;
 import io.github.vivekdavara.keystore.Bytes;
 import io.github.vivekdavara.keystore.Options;
 import io.github.vivekdavara.keystore.Store;
+import io.github.vivekdavara.keystore.StoreCheck;
 import io.github.vivekdavara.keystore.StoreDump;
 import io.github.vivekdavara.keystore.server.Client;
 import io.github.vivekdavara.keystore.server.Follower;
@@ -29,6 +30,10 @@ import java.util.concurrent.CountDownLatch;
  * keystore compact DIR          merge every table into one
  * keystore dump DIR             list the tables, the logs' records, and what recovery would do;
  *                               changes nothing
+ * keystore verify DIR           read every table block and log record and check them; exit 3 if
+ *                               anything is damaged; changes nothing
+ * keystore snapshot DIR TARGET  copy the store into TARGET (a new directory), which opens as a
+ *                               store; its tables are hard links where the file system allows
  * keystore serve DIR PORT       serve DIR as a leader on 127.0.0.1:PORT until stopped, keeping
  *                               64 MiB of flushed logs for followers (PORT 0: any free port)
  * keystore follow DIR PORT LEADER_HOST:PORT
@@ -38,7 +43,7 @@ import java.util.concurrent.CountDownLatch;
  * </pre>
  *
  * Exit status: 0 done, 1 not found or an error, 2 usage, 3 the log is damaged so that a store
- * would refuse to open (dump only). {@code serve} and {@code follow} run until SIGTERM or SIGINT,
+ * would refuse to open (dump), or a table or log is damaged (verify). {@code serve} and {@code follow} run until SIGTERM or SIGINT,
  * then close the server, the follower and the store, and exit as the signal says (143 for
  * SIGTERM, 130 for SIGINT); they exit 1 or 2 if they can't start.
  */
@@ -52,6 +57,8 @@ public final class Main {
             "       keystore flush DIR",
             "       keystore compact DIR",
             "       keystore dump DIR",
+            "       keystore verify DIR",
+            "       keystore snapshot DIR TARGET",
             "       keystore serve DIR PORT",
             "       keystore follow DIR PORT LEADER_HOST:PORT",
             "       keystore client HOST:PORT put KEY VALUE | get KEY | delete KEY | info");
@@ -234,8 +241,8 @@ public final class Main {
         }
         int arity = switch (command) {
             case "put" -> 4;
-            case "get", "delete" -> 3;
-            case "flush", "compact", "dump" -> 2;
+            case "get", "delete", "snapshot" -> 3;
+            case "flush", "compact", "dump", "verify" -> 2;
             default -> -1;
         };
         if (arity < 0 || args.length != arity) {
@@ -253,12 +260,20 @@ public final class Main {
             if (command.equals("dump")) {
                 return StoreDump.dump(dir, out) == WalDump.Verdict.REFUSED ? 3 : 0;
             }
+            if (command.equals("verify")) {
+                return StoreCheck.verify(dir, out) > 0 ? 3 : 0;
+            }
             try (Store store = Store.open(dir)) {
                 switch (command) {
                     case "put" -> store.put(Bytes.utf8(args[2]), Bytes.utf8(args[3]));
                     case "delete" -> store.delete(Bytes.utf8(args[2]));
                     case "flush" -> store.flush();
                     case "compact" -> store.compactAll();
+                    case "snapshot" -> {
+                        Store.Snapshot s = store.snapshot(Path.of(args[2]));
+                        out.printf("keystore: snapshot of %s at #%d in %s: %d tables, %d bytes, %d hard-linked%n",
+                                store.directory(), s.lastSequence(), s.directory(), s.tables(), s.bytes(), s.linked());
+                    }
                     default -> {
                         byte[] key = Bytes.utf8(args[2]);
                         Optional<byte[]> value = store.get(key);

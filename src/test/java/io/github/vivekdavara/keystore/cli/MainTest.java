@@ -161,6 +161,61 @@ class MainTest {
      * refuse, and exits 3.
      */
     @Test
+    void snapshotCopiesAStoreThatOpensAndVerifies() {
+        String d = dir.resolve("store").toString();
+        String target = dir.resolve("snapshot").toString();
+        assertEquals(0, run("put", d, "city", "Boston"));
+        assertEquals(0, run("flush", d));
+        assertEquals(0, run("put", d, "river", "Charles"));
+        assertEquals(0, run("snapshot", d, target));
+        assertTrue(out.startsWith("keystore: snapshot of ") && out.contains(" at #2 in ")
+                && out.endsWith(": 2 tables, " + tableBytes(dir.resolve("snapshot")) + " bytes, 2 hard-linked\n"), out);
+        assertEquals(0, run("get", target, "river"));
+        assertEquals("Charles\n", out);
+        assertEquals(0, run("verify", target));
+        assertEquals("000005.sst: ok, 1 entries in 1 blocks, writes #2 to #2\n"
+                + "000003.sst: ok, 1 entries in 1 blocks, writes #1 to #1\n"
+                + "000006.log: ok, no writes\nok\n", out, "the get above opened it, which made its first log");
+        assertEquals(1, run("snapshot", d, target), "the target exists");
+        assertTrue(err.startsWith("keystore: ") && err.contains("must not exist"), err);
+        assertEquals(1, run("snapshot", dir.resolve("nothing").toString(), target));
+        assertEquals("keystore: no store at " + dir.resolve("nothing") + "\n", err);
+    }
+
+    private static long tableBytes(Path dir) {
+        try (var files = Files.list(dir)) {
+            return files.filter(f -> f.toString().endsWith(".sst")).mapToLong(f -> f.toFile().length()).sum();
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+    }
+
+    /** Damage in a data block: open and dump don't read blocks, so they don't see it; verify does. */
+    @Test
+    void verifyFindsDamageThatDumpAndOpenDont() throws IOException {
+        String d = dir.toString();
+        assertEquals(0, run("put", d, "city", "Boston"));
+        assertEquals(0, run("flush", d));
+        assertEquals(0, run("put", d, "river", "Charles"));
+        assertEquals(0, run("verify", d));
+        assertEquals("000003.sst: ok, 1 entries in 1 blocks, writes #1 to #1\n"
+                + "000002.log: ok, writes #2 to #2\nok\n", out);
+        try (RandomAccessFile table = new RandomAccessFile(dir.resolve("000003.sst").toFile(), "rw")) {
+            table.seek(6);
+            int b = table.read();
+            table.seek(6);
+            table.write(b ^ 0x01);
+        }
+        assertEquals(0, run("dump", d), "dump reads no data block");
+        assertEquals(0, run("get", d, "river"), "nor does a read of a key elsewhere");
+        assertEquals(3, run("verify", d));
+        assertTrue(out.startsWith("000003.sst: DAMAGED: ") && out.contains("fails its checksum")
+                && out.endsWith("000002.log: ok, writes #2 to #2\n1 damaged\n"), out);
+        assertEquals(1, run("get", d, "city"));
+        assertTrue(err.contains("fails its checksum"), err);
+    }
+
+    @Test
     void dumpListsEveryLiveLogAndRefusesATornOlderOne() throws IOException {
         String d = dir.toString();
         run("put", d, "a", "1");

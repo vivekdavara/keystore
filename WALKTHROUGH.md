@@ -2,8 +2,9 @@
 
 Questions an interviewer is likely to ask about this project, with short answers grounded in the code. Each answer
 names the file or test to open. Day 1 covered the memtable, the write-ahead log, recovery and the store; day 2 added
-tables, the flush, the manifest, versions and compaction ("Tables and compaction", below); day 3 adds the server and
-replication ("The server and replication", below).
+tables, the flush, the manifest, versions and compaction ("Tables and compaction", below); day 3 added the server
+and replication ("The server and replication"); day 4 adds crash tests with killed processes, snapshots, damage
+found while running, and JMH ("Failure and measurement", below).
 
 **Reading order:** DESIGN.md "Write path" and "Recovery" → `Store.write` → `memtable/SkipList.put` →
 `wal/WalFormat` (the table at the top) → `wal/WalReader.read` → `StoreFaultTest` and `StoreLockTest`. For day 2:
@@ -12,7 +13,10 @@ DESIGN.md "Tables", "The flush", "Versions" and "Compaction" → `sstable/TableF
 `StoreConcurrencyTest`. For day 3: DESIGN.md "The server" and "Replication" → `server/Protocol` (the table at the
 top) → `server/Server.serve`, `answer`, `ship`, `checkHistory` → `LogTail.read` and `open` → `server/Follower.run`,
 `stream` and `follow` → `Store.replicate`, `appendAndApply` and `awaitSequence` → `ReplicationTest`,
-`FollowerStreamTest` and `FollowerCrashCycleTest`.
+`FollowerStreamTest` and `FollowerCrashCycleTest`. For day 4: DESIGN.md "Snapshots", "Damage found while running"
+and "Day 4's tests" → `Workload` → `KillTarget` (`KillSwitch`, `die`) → `KillTest` (`Child`, `check`) →
+`FollowerKillTest` → `Store.snapshot` (and `link`, `deleteTree`) → `Manifest` (the checksum, and `decode` of version
+1) → `StoreCheck.verify` → `SnapshotTest` and `TableDamageTest` → `jmh/ReadBenchmark`.
 
 ## The big picture
 
@@ -430,14 +434,105 @@ new writes under those numbers, `SYNC` catches it: the follower sends the stored
 11 checksum`), the leader reads its own write 10 and compares, and a mismatch is `ERR DIVERGED 10`. It's Raft's
 check of the previous entry's term, with the record's CRC32C standing in for the term
 (`ReplicationTest.aFollowerWhoseLeaderCameBackWithADifferentHistoryStops`: without it, the follower streamed on to 12
-with a mixed history). The gaps: a follower that restarted with every write in its tables doesn't know its last
-checksum, and a leader whose log no longer holds that write can't compare; then nothing is checked.
+with a mixed history). On day 3 a follower that restarted with every write in its tables didn't know its last
+checksum and sent a bare `SYNC`; since day 4 the manifest keeps it (`ReplicationTest.aFollowerRestartedWithEvery-
+WriteInItsTablesStillChecksItsHistory`). The gap left: a leader whose log no longer holds that write can't compare,
+and then nothing is checked.
+
+## Failure and measurement (day 4)
+
+**How do the kill tests know what the store should hold after a SIGKILL?**
+The child's writes are `Workload`'s: write N is a pure function of the seed and N (`Workload.write`), so the test
+never needs the child to say what it wrote, only how far it got. The child prints `ack N` after write N returns
+(`KillTarget.main`), one `write(2)` to a pipe, so a line arrives whole or not at all. After the death the test reopens
+the store, takes its last sequence number L, which must be the last ack or the one after (the write in flight can
+have reached the log; it can't be further, since the next write starts only after the ack is printed), replays the
+workload's first L writes into a model, and compares every key (`KillTest.check`).
+
+**Why kill a real process instead of simulating the crash, as days 1–3 did?**
+The in-process crash tests copy the directory at a fault and recover the copy, which is exact about the files but
+shares a JVM: the static set of open directories, the kept-open lock channels, the classes. A SIGKILL leaves nothing
+of the process: the kernel closes its files and releases its POSIX lock, and the next process starts cold, as it
+would in production. What it doesn't do is lose the page cache, so a kill can't show a missing force; those are
+counted (`DurabilityTest`, the order of a snapshot's forces), not killed.
+
+**Random kills land mostly in one place. How did you get deaths everywhere?**
+Most of a write's time is its force (3 ms under `EVERY_WRITE` on this Mac), so random deaths mostly hit forces: 17 of
+20 recovered the write in flight. So the child can also kill itself: every channel the store opens is wrapped in a
+`KillSwitch` sharing one countdown, and the N-th write or force cuts its write at a random byte and sends the process
+SIGKILL (`KillTarget.die`). The test draws N until deaths have landed on all seven kinds of step; for a seed the
+file operations are deterministic, so it takes 46 and 36 deaths, here and in CI. With the covered logs deleted
+before the manifest names the table, it loses 26 and 24 acknowledged writes.
+
+**Tell me about bugs in your own test harness.**
+Three today. `Process.destroyForcibly()` sends SIGKILL and also closes the child's streams, so the acks still in the
+pipe were lost and the test's idea of "acknowledged" was short; the children are killed with `kill(1)` instead
+(`KillTest.Child.kill`). The review found the chosen-step test reading the child's stderr from the first byte, so any
+JVM message ("Picked up JAVA_TOOL_OPTIONS: ...") failed it; it now finds the child's line among others. And CI failed
+once on day 3's `FollowerCrashCycleTest`: a fault armed for a follower's writes wasn't used up when the follower
+caught up in fewer operations (batches form by timing), and it fired in the cycle's `close()`; the countdown is now
+disarmed before close.
+
+**How does a snapshot stay exact while writes go on?**
+Under the write lock: flush the memtable, pin the current version, read the last sequence number and checksum. After
+the flush the pinned tables hold exactly the writes up to that number. Then, outside the lock, the tables are
+hard-linked into a new directory, a manifest naming them is written, and the directory is renamed into place
+(`Store.snapshot`). Writes go on meanwhile into new memtables and tables the snapshot never sees. The pin matters
+because a merge can replace the tables during the links: `SnapshotTest.theTablesASnapshotCopiesSurviveAMerge-
+ThatReplacesThem` holds a snapshot at its first copy, runs `compactAll`, and checks the old files are still there;
+without the pin they're gone.
+
+**Why are hard links safe here?**
+Because a table never changes once written: `TableWriter` creates it with `CREATE_NEW`, writes it once and forces
+it, and `Table` only ever opens it for reading. Merges write new tables and delete old ones, and deleting a link
+removes only that name. So the store and its snapshot can share an inode for as long as either keeps it. The cost is
+that a snapshot keeps a table's space allocated after the store deletes it, and damage to the bytes is in both.
+
+**Tell me about the bug the review found on day 4.**
+The first snapshot built itself in the target directory and, on failure, deleted the tables and the directory, but
+not `MANIFEST.tmp` or `MANIFEST`. If the manifest's force failed, the target was left holding `MANIFEST.tmp`, and
+`Store.open` took that for a new store: it opened, without an error, as an empty store at sequence 0, though the
+source held 300 writes (reproduced with the review's test on `0520e30`). A crash mid-snapshot had the same hole when
+there were no tables to give it away. Now a snapshot is built in `.TARGET.snapshot-N` beside the target and renamed
+into place last, so the target is a whole snapshot or absent, and a failure deletes what was built;
+`SnapshotTest.aSnapshotFailingAnywhereLeavesNothing` fails each of its writes and forces in turn.
+
+**What happens when a table block goes bad?**
+Nothing until something reads it: open checks a table's footer, filter and index, not its data blocks. Then a read
+of that block fails with `CorruptTableException`, never a wrong value and never "not found" (which would let an older
+table's overwritten value through); other reads and writes go on. A merge that reaches it fails the store's writes,
+as any failed merge does, and leaves the manifest unchanged. `keystore verify` finds it first by reading every block
+(`TableDamageTest`). Writing that test found a server bug: the error reply carried the table's full path and hit
+the 128-byte line limit before saying what was wrong; it now names the file alone.
+
+**Why doesn't open just check every block?**
+It would make opening a store as slow as reading all of it, every time, to catch damage that is rare and that a read
+catches anyway (every block has a checksum covering its offset). Open checks what reads depend on to be safe: the
+footer, the filter and the index, all in memory afterwards. A full check is a separate, deliberate act
+(`StoreCheck`), like `fsck` or a scrub.
+
+**What does the Bloom filter buy, in numbers?**
+With 14 tables and keys that no table's range rules out, an absent key costs 8.84 block reads at 1 bit a key and
+0.114 at the default 10; JMH measured 69,409 against 1,735,369 lookups a second, 25 times (`ReadBenchmark`). The
+block counts are 14 times the formula's false-positive rate, `(1 - e^(-k/b))^k`, at every setting. Present keys gain
+4 times, since their own block is always read.
+
+**Why does JMH's write throughput under `NEVER` vary from 102,000 to 288,000 a second?**
+The iterations go on in one store, so flushes and merges land in some and not others, and merges grow as the size
+tiers do; they run in the writing thread, under the write lock. It's the cost day 2 measured as a 254 ms stall,
+seen as throughput. Moving them to a background thread is the fix, not built yet.
+
+**Why put the last write's checksum in the manifest?**
+For day 3's divergence check. A follower proves where its history ends by sending its last write's stored checksum
+with `SYNC`; a store knew it only while a log held that write, so after a flush (or when started from a snapshot,
+which is all tables) it sent nothing and nothing was checked. The manifest is written at every flush, so it can carry
+it: format version 2, and a version-1 manifest still reads, with the checksum unknown (`ManifestTest`).
 
 ## What's next
 
 **What would you build next?**
-Crash tests with a killed process, on a leader and a follower; snapshots, which also give a `BEHIND` follower a copy
-of the tables to start from; JMH benchmarks; and moving flushes and merges to a background thread with group commit
-(day 4). For replication: keeping the last write's checksum across a follower's restart (in the manifest), walking
-back to the last matching write after a divergence, and semi-synchronous writes. For the tables
-themselves: a block cache, prefix compression within blocks, and leveled compaction to compare against size-tiered.
+Flushes and merges on a background thread, with group commit for `EVERY_WRITE`'s writers (the JMH write numbers show
+the cost of not having them). A `SNAPSHOT` command, so a `BEHIND` follower can fetch a running leader's snapshot over
+the connection instead of someone making one on the leader's machine. For replication: walking back to the last
+matching write after a divergence, and semi-synchronous writes. For the tables themselves: a block cache, prefix
+compression within blocks, and leveled compaction to compare against size-tiered.

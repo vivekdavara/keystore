@@ -93,6 +93,9 @@ class FollowerKillTest {
                     }
                     Thread.onSpinWait();
                 }
+                if (catchUp) {
+                    assertTrue(acknowledged >= target, "the follower got to " + target + " within 30 s: " + acknowledged);
+                }
                 long leaderAtDeath = leader.lastSequence();
                 signal(child, "KILL");
                 assertEquals(128 + 9, child.exitValue(), "a SIGKILL's exit status");

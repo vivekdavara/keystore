@@ -53,6 +53,7 @@ class KillTest {
         private volatile long opened = -1;
         private volatile long lastAck;
         private volatile long acks;
+        private volatile String unexpected; // a line KillTarget doesn't print, if one came
 
         private Child(Process process, Path err) {
             this.process = process;
@@ -87,8 +88,8 @@ class KillTest {
                     } else if (s.startsWith("ack ")) {
                         lastAck = Long.parseLong(s.substring(4));
                         acks++;
-                    } else {
-                        throw new IllegalStateException("not a line KillTarget prints: " + s);
+                    } else if (unexpected == null) {
+                        unexpected = s; // checkKilled fails on it, rather than a later check on a short count
                     }
                 }
             } catch (IOException ignored) {
@@ -116,6 +117,7 @@ class KillTest {
         void checkKilled() throws InterruptedException {
             reader.join(30_000);
             assertTrue(!reader.isAlive(), "the child's output was read to its end");
+            assertEquals(null, unexpected, "a line on stdout that KillTarget doesn't print");
             assertEquals(128 + 9, process.exitValue(), () -> "exit status of a SIGKILL; stderr: " + stderr());
         }
 
@@ -197,9 +199,12 @@ class KillTest {
                 throw new AssertionError("the child never reached its " + at + "th write or force");
             }
             child.checkKilled();
-            String stderr = child.stderr().trim();
-            assertTrue(stderr.startsWith("kill "), () -> "the child said where it died: " + stderr);
-            deaths.merge(stderr.substring(5), 1, Integer::sum);
+            // Its line, among any others: a JVM can print first ("Picked up JAVA_TOOL_OPTIONS: ...",
+            // as the review found with that variable set).
+            String stderr = child.stderr();
+            String where = stderr.lines().filter(l -> l.startsWith("kill ")).findFirst()
+                    .orElseThrow(() -> new AssertionError("the child said where it died: " + stderr));
+            deaths.merge(where.substring(5), 1, Integer::sum);
             long acked = child.acks > 0 ? child.lastAck : model.seq();
             assertTrue(acked >= acknowledged, "acks only go up");
             acknowledged = acked;

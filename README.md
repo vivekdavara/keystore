@@ -290,6 +290,22 @@ puts never fill a 4 MiB log, so no flush runs: that row is the device flush alon
 - **Under `EVERY_WRITE`, each put waits for one device flush** (`F_FULLFSYNC`, about 3 ms on this Mac): 339 a
   second, as day 1's `Bench writes` measured (361).
 
+**What a snapshot costs** (`SnapshotBenchmark`, `scripts/jmh.sh SnapshotBenchmark -f 2 -wi 2 -w 1s -i 5 -r 1s` at
+`0a59726`, 16:27 to 16:28; on battery at 72%, and **not a quiet machine**: VLC and Chrome were using about 3.5 cores,
+load average 9 to 10). A store of 200,000 keys in 4 tables, 27,082,772 bytes; each snapshot deleted after it, outside
+the timing:
+
+| Tables | Time a snapshot | The 10 iterations |
+|---|---|---|
+| Hard-linked | 15.061 ± 0.384 ms | 14.69 to 15.45 ms |
+| Copied (as across file systems) | 50.565 ± 46.709 ms | 37.68 to 51.83 ms, and one of 137.76 |
+
+- **Linked, the time is the forces, not the data**: four of them (the directory before the manifest, the manifest,
+  the directory after the manifest's rename, the parent after the snapshot's rename), each a device flush on this
+  Mac (`F_FULLFSYNC`, about 3 ms for a file on day 1). The links are a few system calls a table.
+- **Copied, it adds the bytes and a force a table**: about 25 ms more for 27 MB here; it grows with the store, where
+  the linked time grows only with the number of tables.
+
 **The kill tests**, as counts, not timings: the first run of each, at 15:09 and 15:16 at `3088daf` and `b1738fe`
 (`mvn test -Dtest='KillTest,FollowerKillTest'`), and `LeaderKillTest` at 16:03. The random runs vary from run to run; the chosen steps don't (a
 seed fixes the sequence of file operations), and CI's Ubuntu runner counted the same.

@@ -916,8 +916,12 @@ public final class Store implements Closeable {
      * {@code .TARGET.snapshot-N} directory, which can be deleted, and a snapshot that fails is
      * deleted.
      *
+     * <p>{@code target} is made absolute and normalized as text, so {@code link/../snap} means the
+     * {@code snap} beside {@code link}, even where {@code link} is a symbolic link to elsewhere.
+     *
      * @throws java.nio.file.FileAlreadyExistsException if {@code target} exists (nothing is flushed)
-     * @throws IllegalArgumentException if {@code target} would be in this store's own directory
+     * @throws IllegalArgumentException if {@code target} would be anywhere in this store's own
+     *     directory, by any path (checked by file key, before anything is created)
      */
     public Snapshot snapshot(Path target) throws IOException {
         return snapshot(target, true);
@@ -977,7 +981,10 @@ public final class Store implements Closeable {
             }
             WriteAheadLog.forceDirectory(building, wrap); // the tables are in place before a manifest names them
             new Manifest(highest + 2, highest + 1, seq, checksum, refs(version.tables)).write(building, wrap);
-            Files.move(building, destination); // rename(2); fails if the target appeared since the check
+            // rename(2). The JDK checks that the target doesn't exist first, so one that appeared since
+            // the check above fails the move; an empty directory made in the instant between the JDK's
+            // check and the rename would be replaced (the second review's note).
+            Files.move(building, destination);
             building = destination; // until its name is durable too: a failed force still fails the snapshot
             WriteAheadLog.forceDirectory(parent, wrap);
             building = null;
@@ -1014,8 +1021,10 @@ public final class Store implements Closeable {
     /**
      * Creates {@code parent/.NAME.snapshot-N} for a snapshot to be built in. NAME is the target's
      * name cut to its first 200 bytes (of UTF-8): found by review, the whole name plus about 30
-     * bytes could pass the file system's limit (255 bytes on APFS and ext4) where the target's own
-     * name didn't, and a snapshot to a 240-byte name failed with "File name too long".
+     * bytes could pass the file system's limit where the target's own name didn't, and a snapshot to
+     * a 240-byte name failed with "File name too long". The limit is 255 bytes on ext4 and 255
+     * characters on APFS (probed here: 255 three-byte characters make a name, 256 don't), and 200
+     * bytes are within both.
      */
     private static Path newSnapshotDirectory(Path parent, String name) throws IOException {
         String prefix = name;

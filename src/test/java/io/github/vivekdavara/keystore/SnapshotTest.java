@@ -275,6 +275,10 @@ class SnapshotTest {
             }
             store.flush(); // and another with the snapshot's flush
             store.put(utf8("last"), utf8("v"));
+            // Only the snapshot's: opening the store forced the parent too, when it created the store's
+            // directory. That force is recorded where the temp directory's path is already real (Linux,
+            // and CI's first run of this test failed on it), not on macOS, where /var is a symlink.
+            events.clear();
             Store.Snapshot snapshot = store.snapshot(tmp.resolve("snapshot"), link);
             List<String> tables = new ArrayList<>();
             for (TableInfo t : store.tables()) {

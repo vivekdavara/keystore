@@ -17,7 +17,10 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.DirectoryStream;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -882,6 +885,105 @@ public final class Store implements Closeable {
         } catch (IOException | RuntimeException | Error e) {
             writer.abandon(); // nothing names it yet
             throw e;
+        }
+    }
+
+    /**
+     * What {@link #snapshot} made.
+     *
+     * @param directory the snapshot: a store directory (its real path)
+     * @param lastSequence the last write it holds
+     * @param lastChecksum that write's stored checksum, or -1 if unknown
+     * @param tables how many tables it holds
+     * @param bytes their total size
+     * @param linked how many of them are hard links to this store's files; the rest were copied
+     */
+    public record Snapshot(Path directory, long lastSequence, long lastChecksum, int tables, long bytes, int linked) {}
+
+    /**
+     * Writes a copy of the store as it is now into {@code target}, which must not exist: a store
+     * directory holding exactly the writes up to the returned sequence number, with that write's
+     * checksum, which {@link #open} opens like any other. A follower can start from it.
+     *
+     * <p>The memtable is flushed first, under the write lock, so that every write is in a table.
+     * Then the tables, which never change once written, are hard-linked into the target (copied
+     * where the file system can't link), outside the lock: writes go on meanwhile, and the version
+     * pinned for the copy keeps the tables a merge replaces until it's done. The target directory
+     * is forced, and only then is a manifest naming the tables written, so a crash leaves a whole
+     * snapshot or one without a manifest, which a store refuses to open. A snapshot that fails
+     * partway is deleted. Fails like {@link #flush} if the flush fails.
+     *
+     * @throws java.nio.file.FileAlreadyExistsException if {@code target} exists
+     */
+    public Snapshot snapshot(Path target) throws IOException {
+        Objects.requireNonNull(target, "target");
+        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+            throw new FileAlreadyExistsException(target.toString(), null, "a snapshot's directory must not exist");
+        }
+        Version version;
+        long seq;
+        long checksum;
+        writeLock.lock();
+        try {
+            ensureWritable();
+            flushAndCompact();
+            version = pin();
+            seq = lastSeq.get();
+            checksum = lastChecksum;
+            if (version.active.size() != 0 || version.frozen != null || manifest.lastSequence() != seq) {
+                version.release();
+                throw new IllegalStateException("after a flush, the tables hold " + manifest.lastSequence()
+                        + " of " + seq + " writes");
+            }
+        } finally {
+            writeLock.unlock();
+        }
+        List<Path> made = new ArrayList<>();
+        try {
+            Path parent = target.toAbsolutePath().getParent();
+            createDirectory(parent, wrap);
+            Files.createDirectory(target); // fails if it appeared since the check
+            made.add(target);
+            WriteAheadLog.forceDirectory(parent, wrap);
+            long bytes = 0;
+            int linked = 0;
+            long highest = 0;
+            for (Table table : version.tables) {
+                Path copy = target.resolve(table.file().getFileName());
+                if (link(copy, table.file())) {
+                    linked++;
+                } else {
+                    Files.copy(table.file(), copy);
+                    try (FileChannel channel = wrap.apply(copy, FileChannel.open(copy, StandardOpenOption.WRITE))) {
+                        channel.force(false);
+                    }
+                }
+                made.add(copy);
+                bytes += table.fileBytes();
+                highest = Math.max(highest, table.number());
+            }
+            WriteAheadLog.forceDirectory(target, wrap); // the tables are in place before a manifest names them
+            new Manifest(highest + 2, highest + 1, seq, checksum, refs(version.tables)).write(target, wrap);
+            return new Snapshot(target.toRealPath(), seq, checksum, version.tables.size(), bytes, linked);
+        } catch (IOException | RuntimeException | Error e) {
+            for (int i = made.size() - 1; i >= 0; i--) { // the directory last
+                deleteQuietly(made.get(i));
+            }
+            throw e;
+        } finally {
+            version.release();
+        }
+    }
+
+    /** Hard-links {@code link} to {@code file}; false if this file system can't. */
+    private static boolean link(Path link, Path file) throws IOException {
+        try {
+            Files.createLink(link, file);
+            return true;
+        } catch (FileAlreadyExistsException e) {
+            throw e;
+        } catch (UnsupportedOperationException | FileSystemException e) {
+            return false; // across file systems, say: copy it
         }
     }
 

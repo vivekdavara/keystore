@@ -1011,10 +1011,19 @@ public final class Store implements Closeable {
         return false;
     }
 
-    /** Creates {@code parent/.NAME.snapshot-N} for a snapshot to be built in. */
+    /**
+     * Creates {@code parent/.NAME.snapshot-N} for a snapshot to be built in. NAME is the target's
+     * name cut to its first 200 bytes (of UTF-8): found by review, the whole name plus about 30
+     * bytes could pass the file system's limit (255 bytes on APFS and ext4) where the target's own
+     * name didn't, and a snapshot to a 240-byte name failed with "File name too long".
+     */
     private static Path newSnapshotDirectory(Path parent, String name) throws IOException {
+        String prefix = name;
+        while (prefix.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 200) {
+            prefix = prefix.substring(0, prefix.offsetByCodePoints(prefix.length(), -1));
+        }
         for (int attempt = 0; ; attempt++) {
-            Path building = parent.resolve("." + name + ".snapshot-" + (System.nanoTime() + attempt));
+            Path building = parent.resolve("." + prefix + ".snapshot-" + (System.nanoTime() + attempt));
             try {
                 return Files.createDirectory(building);
             } catch (FileAlreadyExistsException e) {

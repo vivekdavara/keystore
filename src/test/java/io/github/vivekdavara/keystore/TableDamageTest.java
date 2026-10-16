@@ -117,8 +117,49 @@ class TableDamageTest {
                 assertTrue(e.getMessage().contains("fails its checksum"), e.getMessage());
                 assertArrayEquals(utf8("new-999-" + "x".repeat(100)), client.get(key(999)).orElseThrow(),
                         "the same connection goes on");
+                // A merge that reaches the block fails the store; a write's reply names the damage too,
+                // which StoreFailedException's own message, path and all, didn't fit (found by review).
+                assertThrows(CorruptTableException.class, store::compactAll);
+                ServerException failed = assertThrows(ServerException.class, () -> client.put(utf8("k"), utf8("v")));
+                assertEquals(ErrorCode.FAILED, failed.code());
+                assertTrue(failed.getMessage().contains(newer.getFileName() + ": data block 0")
+                        && failed.getMessage().contains("fails its checksum"), failed.getMessage());
             }
         }
+    }
+
+    /** Logs a leader keeps for its followers, which the tables cover, aren't checked as logs to replay. */
+    @Test
+    void verifyPassesAStoreThatKeepsLogsForFollowers() throws IOException {
+        try (Store store = Store.open(dir, options().withFlushLogBytes(4 << 10).withRetainLogBytes(1 << 20))) {
+            for (int i = 0; i < 2_000; i++) {
+                store.put(key(i % 1_000), utf8("v" + i));
+            }
+        }
+        long kept;
+        try (var files = java.nio.file.Files.list(dir)) {
+            kept = files.filter(f -> f.getFileName().toString().endsWith(Store.LOG_SUFFIX)).count();
+        }
+        assertTrue(kept > 3, kept + " logs");
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        assertEquals(0, StoreCheck.verify(dir, new PrintStream(out, true, StandardCharsets.UTF_8)), out.toString());
+    }
+
+    /** A table that doesn't match the manifest's record of it (here, its recorded size) is damage. */
+    @Test
+    void verifyChecksEachTableAgainstTheManifestsRecord() throws IOException {
+        try (Store store = Store.open(dir, options())) {
+            twoTables(store);
+        }
+        Manifest m = Manifest.read(dir);
+        Manifest.TableRef first = m.tables().get(0);
+        java.util.List<Manifest.TableRef> refs = new java.util.ArrayList<>(m.tables());
+        refs.set(0, new Manifest.TableRef(first.number(), first.fileBytes() + 1, first.smallestSeq(), first.largestSeq()));
+        new Manifest(m.nextFileNumber(), m.logNumber(), m.lastSequence(), m.lastChecksum(), refs)
+                .write(dir, (path, channel) -> channel);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        assertEquals(1, StoreCheck.verify(dir, new PrintStream(out, true, StandardCharsets.UTF_8)));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("doesn't match the manifest's record of it"), out::toString);
     }
 
     /** {@link StoreCheck} reads every block, so it finds damage no read has reached; a clean store passes. */

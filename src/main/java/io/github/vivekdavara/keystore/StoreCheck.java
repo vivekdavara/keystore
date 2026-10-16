@@ -27,21 +27,29 @@ import java.util.List;
  * <p>Per table: it opens (footer, filter and index checks) and matches the manifest's record of it;
  * every data block passes its checksum and holds well-formed entries in strictly increasing key
  * order, ending with the index's key; the footer's entry and tombstone counts are right; every
- * entry's sequence number is in the table's range; and a point lookup (index, Bloom filter, block)
- * finds every entry. Per log: what recovery would do with it ({@link WalDump}).
+ * entry's sequence number is within the footer's range (not that the range's ends occur); and a
+ * point lookup (index, Bloom filter, block) finds every entry, which reads a block per entry (there
+ * is no block cache). Per log: what recovery would do with it ({@link WalDump}). A manifest that
+ * fails its checks is damage too; with no manifest there is no store.
  */
 public final class StoreCheck {
     private StoreCheck() {}
 
     /**
      * Checks the store in {@code dir}, printing a line per table and log; returns how many of them
-     * are damaged (a log recovery would refuse counts; a torn tail, which recovery truncates,
-     * doesn't).
+     * are damaged (a log recovery would refuse counts; a torn tail in the newest, which recovery
+     * truncates, doesn't). A damaged manifest is reported as the one damaged file.
      *
-     * @throws IOException if there is no manifest, or it can't be read
+     * @throws IOException if there is no manifest, or a directory can't be listed
      */
     public static int verify(Path dir, PrintStream out) throws IOException {
-        Manifest manifest = Manifest.read(dir);
+        Manifest manifest;
+        try {
+            manifest = Manifest.read(dir);
+        } catch (IOException e) { // there is one, and it fails its checks: nothing else can be read
+            out.printf("%s: DAMAGED: %s%n1 damaged%n", Manifest.FILE, e.getMessage());
+            return 1;
+        }
         if (manifest == null) {
             throw new IOException("no store at " + dir + " (no " + Manifest.FILE + ")");
         }

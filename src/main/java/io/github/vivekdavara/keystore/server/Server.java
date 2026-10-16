@@ -505,7 +505,7 @@ public final class Server implements Closeable {
         } catch (LogFullException e) {
             return Protocol.errorLine(ErrorCode.FULL, e.getMessage());
         } catch (StoreFailedException e) {
-            return Protocol.errorLine(ErrorCode.FAILED, e.getMessage());
+            return Protocol.errorLine(ErrorCode.FAILED, reason(e));
         } catch (IOException e) {
             // The write may or may not be in the log, and the store takes no more: as for a crash,
             // the client can't know whether it happened.
@@ -519,10 +519,17 @@ public final class Server implements Closeable {
      * An error's text for a reply line, which holds 128 bytes. A damaged table's message starts
      * with the file's whole path, which can fill the line before it says what is wrong (found by
      * TableDamageTest: "INTERNAL: /private/var/folders/.../000005.sst: data block 0 at of"), so
-     * that one is sent with the file's name alone.
+     * that one is sent with the file's name alone, also when it is the cause of another error.
      */
     private static String reason(Exception e) {
-        return e instanceof CorruptTableException c ? c.file().getFileName() + ": " + c.problem() : e.getMessage();
+        // Anywhere in the chain: after a merge read the damage, writes fail with StoreFailedException,
+        // whose own message, with the path in it, was cut off the same way (found by review).
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof CorruptTableException c && c.file() != null) {
+                return c.file().getFileName() + ": " + c.problem();
+            }
+        }
+        return e.getMessage();
     }
 
     private String info() {

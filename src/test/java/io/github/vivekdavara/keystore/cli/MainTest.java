@@ -213,6 +213,16 @@ class MainTest {
                 && out.endsWith("000002.log: ok, writes #2 to #2\n1 damaged\n"), out);
         assertEquals(1, run("get", d, "city"));
         assertTrue(err.contains("fails its checksum"), err);
+
+        // A damaged manifest is damage too (exit 3), not an error (it was exit 1, said the review).
+        try (RandomAccessFile manifest = new RandomAccessFile(dir.resolve("MANIFEST").toFile(), "rw")) {
+            manifest.seek(20);
+            int b = manifest.read();
+            manifest.seek(20);
+            manifest.write(b ^ 0x01);
+        }
+        assertEquals(3, run("verify", d));
+        assertEquals("MANIFEST: DAMAGED: " + dir.resolve("MANIFEST") + ": the manifest fails its checksum\n1 damaged\n", out);
     }
 
     @Test

@@ -751,8 +751,12 @@ table, and checks the old files are still there; without the pin they are gone.)
 version, which built it in the target itself, leaving `MANIFEST.tmp` there when the manifest's force failed: a store
 then opened that directory as a new, empty store at sequence 0 (the source held 300 writes). A crash had the same
 hole for a snapshot with no tables. Now a failure deletes whatever was built (the renamed target too, if the parent's
-force fails), and a crash leaves at most a `.TARGET.snapshot-N` directory, which can be deleted. A target in the
-store's own directory is refused: it could take a name the store writes (`MANIFEST.tmp`, a log's).
+force fails), and a crash leaves at most a `.TARGET.snapshot-N` directory, which can be deleted (its name has the
+target's cut to 200 bytes, so it fits wherever the target's does: a second review found a 240-byte target failing).
+A target anywhere in the store's own directory is refused, before anything is created: it could take a name the
+store writes (`MANIFEST.tmp`, a log's). The check compares file keys, up from the target's nearest existing ancestor:
+a second review got past a real-path comparison with a macOS firmlink (as day 1's review did the lock) and past a
+check made after creating the missing parents (`STORE/MANIFEST.tmp/snap`).
 
 **What it costs the store.** The flush, under the write lock, as any flush; then nothing: the links and the manifest
 are outside it. A snapshot pins its tables until it finishes, so a merge's inputs stay on disk until then, and a
@@ -779,9 +783,11 @@ it, and what matters is what the store does then:
   its file name only: with the whole path, the 128-byte reply line was full before it said what was wrong (found by
   `TableDamageTest`: `INTERNAL: /private/var/folders/.../000005.sst: data block 0 at of`).
 - **`keystore verify DIR` finds it first** (`StoreCheck`): it reads every block of every table the manifest names
-  (block checksums, entries, key order, the index's keys, the footer's counts and sequence range, and a point lookup
-  of every entry through the index and the filter) and checks every log recovery would replay, as `dump` does;
-  exit 3 if anything is damaged. Like `dump`, it changes nothing and takes no lock.
+  (block checksums, entries, key order, the index's keys, the footer's counts, every entry's sequence number within
+  the footer's range, and a point lookup of every entry through the index and the filter, a block read each) and
+  checks every log recovery would replay, as `dump` does; a log after a damaged one is listed as not checked (where
+  its writes should start isn't known), and a damaged manifest is damage too. Exit 3 if anything is damaged. Like
+  `dump`, it changes nothing and takes no lock.
 
 There is no repair: a damaged table's writes are lost unless a follower or a snapshot has them. A follower doesn't
 read its leader's tables (it streams the log), so damage in a leader's table doesn't reach it; a snapshot links the
@@ -951,9 +957,13 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
   snapshot copies them; 20 snapshots during writes, each exactly a prefix; a follower that was `BEHIND` starting
   again from a snapshot and catching up.
 - **Damage** (`TableDamageTest`, `MainTest`): a flipped byte in a live table's block fails the read of that block
-  and nothing else; a merge that reaches it fails the store and leaves the manifest; the server's reply says what is
-  wrong; `verify` finds damage in a block no read has reached, and passes a clean store; `dump` and reads elsewhere
-  don't see it.
+  and nothing else; a merge that reaches it fails the store and leaves the manifest; the server's replies, to the
+  read and to later writes, say what is wrong; `verify` finds damage in a block no read has reached, a table that
+  doesn't match the manifest's record, and a damaged manifest, and passes a clean store and one keeping logs for
+  followers; `dump` and reads elsewhere don't see block damage.
+- **The second review's tests**: `SnapshotInsideTheStoresDirectoryTest` (a firmlinked path, run where there is one;
+  a missing parent named `MANIFEST.tmp`), `SnapshotTargetWithALongNameTest`,
+  `VerifyCountsAnIntactLogAfterADamagedOneTest`.
 - **The manifest's checksum** (`ManifestTest`, `ReplicateTest`, `ReplicationTest`): version 1 still reads, without
   it; every value round-trips; it survives flushes and merges and a reopen; a follower restarted with every write in
   a table stops with `DIVERGED` against a leader with a different history.
@@ -1043,6 +1053,9 @@ Day 4's:
   store deletes it, and damage to a table's bytes is in both. `keystore verify` checks a snapshot like any store.
 - **A crash during a snapshot leaves a `.TARGET.snapshot-N` directory** beside the target, which has to be deleted by
   hand (nothing ever opens it as a store). A failed snapshot deletes it, but not parent directories it created.
-- **`keystore verify` reads the whole store**, and takes no lock: on a running store, a merge can delete a table it
-  is about to read, which it then reports as missing. Run it on a stopped store, a follower's copy, or a snapshot.
+- **`keystore verify` reads the whole store**, and takes no lock: on a running store (a running follower's too), a
+  merge can delete a table it is about to read, which it then reports as missing, and a flush between its reading
+  the manifest and listing the logs can make a good log look out of sequence. Run it on a stopped store or a
+  snapshot. Three of its checks (the tombstone count, the per-entry sequence range, the point lookup) have no test
+  that fails without them: a table that passes its checksums but breaks one needs a table writer that lies.
 - **No repair.** A damaged table's writes are lost unless a follower or a snapshot taken before the damage has them.

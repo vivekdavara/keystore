@@ -506,6 +506,16 @@ there were no tables to give it away. Now a snapshot is built in `.TARGET.snapsh
 into place last, so the target is a whole snapshot or absent, and a failure deletes what was built;
 `SnapshotTest.aSnapshotFailingAnywhereLeavesNothing` fails each of its writes and forces in turn.
 
+**What did the second review find?**
+Three bugs in code written after the first review. The worst was day 1's firmlink trap in a new place: a snapshot is
+refused inside the store's own directory (it could take a name the store writes, like `MANIFEST.tmp`), and the check
+compared real paths, but `/System/Volumes/Data/private/...` and `/private/...` are one directory with two real paths
+on macOS. A snapshot there became `STORE/MANIFEST.tmp`, and every flush failed from then on. Any "is this the same
+directory" check needs the file key (device and inode), as `Store.open` already used; the check now walks up from
+the target's nearest existing ancestor comparing file keys, before creating anything. The others: `verify` counted a
+good log as damaged after a damaged one, and my fix for the first review made long target names fail, since the
+build directory's name is 30 bytes longer.
+
 **What happens when a table block goes bad?**
 Nothing until something reads it: open checks a table's footer, filter and index, not its data blocks. Then a read
 of that block fails with `CorruptTableException`, never a wrong value and never "not found" (which would let an older

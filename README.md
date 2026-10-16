@@ -276,7 +276,8 @@ lookup reads are counted in the benchmark's teardown (warm-up included).
   half the newer tables first: 5.28 a lookup.
 
 `WriteBenchmark`: one thread puts random keys into a store that starts empty for each fork; the iterations go on in
-the same store, so flushes and merges are in the numbers.
+the same store, so under `NEVER` flushes and merges are in the numbers. (Under `EVERY_WRITE` a fork's 2,700 or so
+puts never fill a 4 MiB log, so no flush runs: that row is the device flush alone.)
 
 | Sync policy | Puts a second | The 10 iterations |
 |---|---|---|
@@ -553,6 +554,27 @@ fixes: the chosen-step kill test read the child's stderr from the start, so a JV
 JAVA_TOOL_OPTIONS" failed it (reproduced), and the follower kill test now asserts that a catching-up follower got as
 far as it was meant to before dying. It also found DESIGN.md not yet updated, which it now is.
 
+A second review, at `b14dab1` (the code written after the first: `verify`, the rewritten snapshot, the server's
+replies, JMH), about 15 minutes, found three more, each with a test that failed here before its fix:
+
+- **A snapshot could still go into the store's own directory.** The check compared the real path of the target's
+  parent with the store's, and a macOS firmlink is a second real path (`/System/Volumes/Data/private/...` for
+  `/private/...`): day 1's lock bug again, in a new place. That snapshot became `STORE/MANIFEST.tmp`, and every
+  flush after it failed, after a reopen too. And for `STORE/MANIFEST.tmp/snap`, the snapshot created the missing
+  parent before checking anything. A target is now refused if its nearest existing ancestor is in the store's
+  directory at any depth, compared by file key, before anything is created.
+- **`verify` counted an intact log as damaged after a damaged one**, checking it from the damaged log's last good
+  record ("2 damaged" for one). Logs after a damaged one are now listed as not checked, as `dump` stops there.
+- **A long target name failed** (a regression from the first fix): the build directory's name is about 30 bytes
+  longer than the target's, so a 240-byte name, which APFS and ext4 take, failed with "File name too long". The name
+  in it is cut to 200 bytes.
+
+From its notes: `verify` exited 1, not 3, on a damaged manifest (now 3); after a merge reached a damaged block, write
+replies were cut off before they named the table (now the short form too); and tests now cover kept logs and a table
+that doesn't match the manifest's record. Three of `verify`'s checks still have no test that fails without them (the
+tombstone count, the per-entry sequence range and the point lookup): making a table that passes its checksums but
+breaks one of them needs a table writer that lies.
+
 Found while building, before the review: the server's reply to a damaged read was cut at the protocol's 128-byte line
 limit by the table's path, before it said what was wrong (`TableDamageTest`); it now names the file alone. And CI
 failed once on a day-3 test, `FollowerCrashCycleTest` (Ubuntu, run 38954660518): a fault armed for a follower's writes
@@ -637,8 +659,9 @@ wasn't used up when it caught up in fewer, and fired at the cycle's close; the c
   checksum of the follower's last write (`DIVERGED`), but only while the leader's log still holds that write.
 - The kill tests keep the page cache, as any process death does, so they can't show a missing force; nothing here
   pulls the power. A snapshot's links keep a table's space after the store deletes it, and a crash mid-snapshot
-  leaves a `.TARGET.snapshot-N` directory to delete by hand. `verify` takes no lock, so on a running store a merge
-  can make a table it reads go missing.
+  leaves a `.TARGET.snapshot-N` directory to delete by hand. `verify` takes no lock, so on a running store (a
+  running follower's too) a merge can make a table it reads go missing, or a flush between its reading the manifest
+  and listing the logs can make a good log look out of sequence: run it on a stopped store or a snapshot.
 - No authentication or TLS; the server listens on the loopback address.
 
 DESIGN.md's "Limitations" has the full list.

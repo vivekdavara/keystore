@@ -111,8 +111,11 @@ class FollowerKillTest {
             writer.join();
             assertEquals(null, writerFailure.get(), "the leader's writer");
             long end = leader.lastSequence();
-            assertTrue(acknowledged > 0 && acknowledged < end, "the follower was killed with work left: "
-                    + acknowledged + " of " + end);
+            // Not that it had work left at its last death: a streaming follower can have caught up with
+            // everything by then (on CI's macOS runner, 216,900 of 216,900), which is fine. What the test
+            // needs is deaths in the middle of a catch-up.
+            assertTrue(acknowledged > 0 && behindAtDeath > 0, "deaths in the middle of a catch-up: " + behindAtDeath
+                    + ", acks up to " + acknowledged + " of " + end);
 
             // The last start catches up, and stops cleanly.
             Process child = startFollower(followerDir, server.port());

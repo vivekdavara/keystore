@@ -66,13 +66,22 @@ public final class StoreCheck {
         Collections.sort(logs);
         long seq = manifest.lastSequence();
         PrintStream nowhere = new PrintStream(OutputStream.nullOutputStream());
+        boolean afterDamage = false;
         for (int i = 0; i < logs.size(); i++) {
             String name = Store.logName(logs.get(i));
+            if (afterDamage) {
+                // Found by review: checked from the damaged log's last good record, an intact log after
+                // it failed as out of sequence and was counted too. Where its writes should start isn't
+                // known, so it isn't judged (as dump stops at the first log recovery refuses).
+                out.printf("%s: not checked: it follows a damaged log%n", name);
+                continue;
+            }
             WalDump.Result result = WalDump.dump(dir.resolve(name), seq + 1, nowhere);
             boolean older = i < logs.size() - 1;
             if (result.verdict() == Verdict.REFUSED || (older && result.verdict() != Verdict.CLEAN)) {
                 out.printf("%s: DAMAGED: recovery would refuse it (`keystore dump` shows where)%n", name);
                 damaged++;
+                afterDamage = true;
             } else {
                 out.printf("%s: ok, %s%s%n", name,
                         result.lastSeq() == seq ? "no writes" : "writes #" + (seq + 1) + " to #" + result.lastSeq(),

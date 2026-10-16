@@ -930,13 +930,13 @@ public final class Store implements Closeable {
         if (absolute.getParent() == null || Files.exists(absolute, LinkOption.NOFOLLOW_LINKS)) {
             throw new FileAlreadyExistsException(target.toString(), null, "a snapshot's directory must not exist");
         }
-        createDirectory(absolute.getParent(), wrap);
-        Path parent = absolute.getParent().toRealPath();
-        if (parent.equals(dir)) {
-            // Its name could be one the store uses (MANIFEST.tmp, a log's), and the store's next
-            // write of that file would fail.
+        if (insideThisStore(absolute)) {
+            // Its name, or a missing parent's, could be one the store uses (MANIFEST.tmp, a log's), and
+            // the store's next write of that file would fail.
             throw new IllegalArgumentException("a snapshot can't go in the store's own directory: " + target);
         }
+        createDirectory(absolute.getParent(), wrap);
+        Path parent = absolute.getParent().toRealPath();
         Path destination = parent.resolve(absolute.getFileName());
         Version version;
         long seq;
@@ -990,6 +990,25 @@ public final class Store implements Closeable {
         } finally {
             version.release();
         }
+    }
+
+    /**
+     * Whether {@code path} is in this store's directory, at any depth: the nearest of its ancestors
+     * that exists is the directory or below it. By file key, as {@link #open} checks directories:
+     * found by review, a real path isn't enough here either, since a macOS firmlink
+     * ({@code /System/Volumes/Data/private/...} for {@code /private/...}) is a second one.
+     */
+    private boolean insideThisStore(Path path) throws IOException {
+        Path existing = path;
+        while (existing != null && !Files.exists(existing)) {
+            existing = existing.getParent();
+        }
+        for (Path p = existing == null ? null : existing.toRealPath(); p != null; p = p.getParent()) {
+            if (identity(p).equals(identity)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Creates {@code parent/.NAME.snapshot-N} for a snapshot to be built in. */

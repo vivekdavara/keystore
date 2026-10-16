@@ -183,6 +183,10 @@ class FollowerCrashCycleTest {
                     closeQuietly(store);
                     throw e;
                 }
+                // A fault armed for this cycle but not reached (the batches took fewer writes and
+                // forces than the countdown) isn't for close: seen once in CI, where it failed the
+                // close's force and the test with it.
+                left.set(Integer.MAX_VALUE);
                 store.close();
             }
             // The last image, followed to the end: the same contents as the leader.

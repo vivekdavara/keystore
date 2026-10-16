@@ -6,6 +6,7 @@ import io.github.vivekdavara.keystore.StoreFailedException;
 import io.github.vivekdavara.keystore.server.Protocol.ErrorCode;
 import io.github.vivekdavara.keystore.server.Protocol.ProtocolException;
 import io.github.vivekdavara.keystore.server.Protocol.Request;
+import io.github.vivekdavara.keystore.sstable.CorruptTableException;
 import io.github.vivekdavara.keystore.wal.LogFullException;
 import io.github.vivekdavara.keystore.wal.WalFormat;
 import java.io.BufferedInputStream;
@@ -319,7 +320,7 @@ public final class Server implements Closeable {
                 try {
                     value = store.get(key);
                 } catch (IOException | IllegalStateException e) {
-                    Protocol.writeLine(out, Protocol.errorLine(ErrorCode.INTERNAL, e.getMessage()));
+                    Protocol.writeLine(out, Protocol.errorLine(ErrorCode.INTERNAL, reason(e)));
                     return true;
                 }
                 if (value.isEmpty()) {
@@ -508,10 +509,20 @@ public final class Server implements Closeable {
         } catch (IOException e) {
             // The write may or may not be in the log, and the store takes no more: as for a crash,
             // the client can't know whether it happened.
-            return Protocol.errorLine(ErrorCode.FAILED, e.getMessage());
+            return Protocol.errorLine(ErrorCode.FAILED, reason(e));
         } catch (IllegalStateException e) {
             return Protocol.errorLine(ErrorCode.INTERNAL, e.getMessage()); // the store is closed
         }
+    }
+
+    /**
+     * An error's text for a reply line, which holds 128 bytes. A damaged table's message starts
+     * with the file's whole path, which can fill the line before it says what is wrong (found by
+     * TableDamageTest: "INTERNAL: /private/var/folders/.../000005.sst: data block 0 at of"), so
+     * that one is sent with the file's name alone.
+     */
+    private static String reason(Exception e) {
+        return e instanceof CorruptTableException c ? c.file().getFileName() + ": " + c.problem() : e.getMessage();
     }
 
     private String info() {

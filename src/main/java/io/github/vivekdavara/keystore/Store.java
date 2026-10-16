@@ -905,21 +905,39 @@ public final class Store implements Closeable {
      * directory holding exactly the writes up to the returned sequence number, with that write's
      * checksum, which {@link #open} opens like any other. A follower can start from it.
      *
-     * <p>The memtable is flushed first, under the write lock, so that every write is in a table.
-     * Then the tables, which never change once written, are hard-linked into the target (copied
-     * where the file system can't link), outside the lock: writes go on meanwhile, and the version
-     * pinned for the copy keeps the tables a merge replaces until it's done. The target directory
-     * is forced, and only then is a manifest naming the tables written, so a crash leaves a whole
-     * snapshot or one without a manifest, which a store refuses to open. A snapshot that fails
-     * partway is deleted. Fails like {@link #flush} if the flush fails.
+     * <p>The memtable is flushed first, under the write lock, so that every write is in a table
+     * (the flush may run a merge, as {@link #flush} does). Then, outside the lock, while writes go
+     * on, the snapshot is built in a new directory beside the target, named
+     * {@code .TARGET.snapshot-N}: the tables, which never change once written, are hard-linked in
+     * (copied and forced where the file system can't link), the directory is forced, and a
+     * manifest naming them is written. The version pinned for this keeps the tables a merge
+     * replaces until they are linked. Last, the directory is renamed to the target and the parent
+     * forced. So the target, if it exists, is a whole snapshot: a crash leaves at most a
+     * {@code .TARGET.snapshot-N} directory, which can be deleted, and a snapshot that fails is
+     * deleted.
      *
-     * @throws java.nio.file.FileAlreadyExistsException if {@code target} exists
+     * @throws java.nio.file.FileAlreadyExistsException if {@code target} exists (nothing is flushed)
+     * @throws IllegalArgumentException if {@code target} would be in this store's own directory
      */
     public Snapshot snapshot(Path target) throws IOException {
+        return snapshot(target, true);
+    }
+
+    /** {@link #snapshot(Path)}; with {@code link} false, every table is copied, as across file systems. */
+    Snapshot snapshot(Path target, boolean link) throws IOException {
         Objects.requireNonNull(target, "target");
-        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+        Path absolute = target.toAbsolutePath().normalize();
+        if (absolute.getParent() == null || Files.exists(absolute, LinkOption.NOFOLLOW_LINKS)) {
             throw new FileAlreadyExistsException(target.toString(), null, "a snapshot's directory must not exist");
         }
+        createDirectory(absolute.getParent(), wrap);
+        Path parent = absolute.getParent().toRealPath();
+        if (parent.equals(dir)) {
+            // Its name could be one the store uses (MANIFEST.tmp, a log's), and the store's next
+            // write of that file would fail.
+            throw new IllegalArgumentException("a snapshot can't go in the store's own directory: " + target);
+        }
+        Path destination = parent.resolve(absolute.getFileName());
         Version version;
         long seq;
         long checksum;
@@ -938,19 +956,15 @@ public final class Store implements Closeable {
         } finally {
             writeLock.unlock();
         }
-        List<Path> made = new ArrayList<>();
+        Path building = null; // what to delete if this fails: the directory being built, then the snapshot
         try {
-            Path parent = target.toAbsolutePath().getParent();
-            createDirectory(parent, wrap);
-            Files.createDirectory(target); // fails if it appeared since the check
-            made.add(target);
-            WriteAheadLog.forceDirectory(parent, wrap);
+            building = newSnapshotDirectory(parent, absolute.getFileName().toString());
             long bytes = 0;
             int linked = 0;
             long highest = 0;
             for (Table table : version.tables) {
-                Path copy = target.resolve(table.file().getFileName());
-                if (link(copy, table.file())) {
+                Path copy = building.resolve(table.file().getFileName());
+                if (link && link(copy, table.file())) {
                     linked++;
                 } else {
                     Files.copy(table.file(), copy);
@@ -958,20 +972,49 @@ public final class Store implements Closeable {
                         channel.force(false);
                     }
                 }
-                made.add(copy);
                 bytes += table.fileBytes();
                 highest = Math.max(highest, table.number());
             }
-            WriteAheadLog.forceDirectory(target, wrap); // the tables are in place before a manifest names them
-            new Manifest(highest + 2, highest + 1, seq, checksum, refs(version.tables)).write(target, wrap);
-            return new Snapshot(target.toRealPath(), seq, checksum, version.tables.size(), bytes, linked);
+            WriteAheadLog.forceDirectory(building, wrap); // the tables are in place before a manifest names them
+            new Manifest(highest + 2, highest + 1, seq, checksum, refs(version.tables)).write(building, wrap);
+            Files.move(building, destination); // rename(2); fails if the target appeared since the check
+            building = destination; // until its name is durable too: a failed force still fails the snapshot
+            WriteAheadLog.forceDirectory(parent, wrap);
+            building = null;
+            return new Snapshot(destination, seq, checksum, version.tables.size(), bytes, linked);
         } catch (IOException | RuntimeException | Error e) {
-            for (int i = made.size() - 1; i >= 0; i--) { // the directory last
-                deleteQuietly(made.get(i));
+            if (building != null) {
+                deleteTree(building, e);
             }
             throw e;
         } finally {
             version.release();
+        }
+    }
+
+    /** Creates {@code parent/.NAME.snapshot-N} for a snapshot to be built in. */
+    private static Path newSnapshotDirectory(Path parent, String name) throws IOException {
+        for (int attempt = 0; ; attempt++) {
+            Path building = parent.resolve("." + name + ".snapshot-" + (System.nanoTime() + attempt));
+            try {
+                return Files.createDirectory(building);
+            } catch (FileAlreadyExistsException e) {
+                if (attempt == 100) {
+                    throw e;
+                }
+            }
+        }
+    }
+
+    /** Deletes a directory this store made and what is in it; failures are added to {@code cause}. */
+    private static void deleteTree(Path building, Throwable cause) {
+        try (DirectoryStream<Path> files = Files.newDirectoryStream(building)) {
+            for (Path file : files) {
+                Files.deleteIfExists(file); // links and copies of tables, MANIFEST.tmp, MANIFEST
+            }
+            Files.deleteIfExists(building);
+        } catch (IOException e) {
+            cause.addSuppressed(e);
         }
     }
 

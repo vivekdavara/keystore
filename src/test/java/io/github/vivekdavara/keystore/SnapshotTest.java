@@ -18,14 +18,18 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class SnapshotTest {
     private static final int KEYS = 200;
@@ -48,8 +52,10 @@ class SnapshotTest {
         }
     }
 
-    @Test
-    void aSnapshotOpensAsAStoreWithExactlyItsWrites() throws IOException {
+    /** Linked (one file system), and copied (as across file systems, where links fail). */
+    @ParameterizedTest(name = "link {0}")
+    @ValueSource(booleans = {true, false})
+    void aSnapshotOpensAsAStoreWithExactlyItsWrites(boolean link) throws IOException {
         Workload workload = new Workload(3, KEYS);
         Workload.Model model = new Workload.Model(workload);
         Store.Snapshot snapshot;
@@ -60,11 +66,13 @@ class SnapshotTest {
             }
             assertTrue(store.memtableSize() > 0 && !store.tables().isEmpty());
             checksum = store.lastChecksum();
-            snapshot = store.snapshot(tmp.resolve("snapshot"));
+            snapshot = store.snapshot(tmp.resolve("snapshot"), link);
             assertEquals(1_000, snapshot.lastSequence());
             assertEquals(checksum, snapshot.lastChecksum());
+            assertEquals(tmp.resolve("snapshot").toRealPath(), snapshot.directory());
             assertEquals(store.tables().size(), snapshot.tables(), "the store's tables, after its flush");
-            assertEquals(snapshot.tables(), snapshot.linked(), "one file system: every table linked");
+            assertEquals(link ? snapshot.tables() : 0, snapshot.linked());
+            assertEquals(List.of("snapshot", "store"), names(tmp), "nothing else beside it");
             for (long seq = 1_001; seq <= 1_500; seq++) { // the store goes on; the snapshot doesn't change
                 workload.apply(store, seq);
             }
@@ -149,7 +157,11 @@ class SnapshotTest {
             assertThrows(FileAlreadyExistsException.class, () -> store.snapshot(tmp.resolve("empty")));
             assertThrows(FileAlreadyExistsException.class, () -> store.snapshot(tmp.resolve("file")));
             assertThrows(FileAlreadyExistsException.class, () -> store.snapshot(tmp.resolve("store")));
-            store.put(utf8("k"), utf8("w")); // refused before anything was done
+            // A name the store could use itself, in its own directory.
+            assertThrows(IllegalArgumentException.class, () -> store.snapshot(tmp.resolve("store/MANIFEST.tmp")));
+            assertEquals(1, store.memtableSize(), "refused before anything was done: nothing flushed");
+            assertEquals(0, store.tables().size());
+            store.put(utf8("k"), utf8("w"));
         }
         try (Stream<Path> files = Files.list(tmp.resolve("empty"))) {
             assertEquals(0, files.count());
@@ -157,36 +169,182 @@ class SnapshotTest {
     }
 
     /**
-     * A snapshot that fails partway (here, at the force of its directory before the manifest) is
-     * deleted, and the store goes on taking writes: only the flush is the store's, and it worked.
+     * A snapshot that fails partway leaves nothing: neither the target nor the directory it was
+     * built in, and the store goes on taking writes (only the flush is the store's, and it worked).
+     * Each of the snapshot's writes and forces is failed in turn (a copied table's force, the
+     * directory's before the manifest, the manifest's write and force, the directory's after it,
+     * the parent's after the rename), until one succeeds. Found by review: a failure while the
+     * manifest was written left MANIFEST.tmp (or MANIFEST) in the target, which a store then opened
+     * as an empty one at sequence 0, and a retry found the target taken.
      */
-    @Test
-    void aFailedSnapshotIsDeletedAndTheStoreGoesOn() throws IOException {
+    @ParameterizedTest(name = "link {0}")
+    @ValueSource(booleans = {true, false})
+    void aSnapshotFailingAnywhereLeavesNothing(boolean link) throws IOException {
         Path target = tmp.resolve("snapshot");
-        AtomicBoolean failNext = new AtomicBoolean();
+        Path storeDir = tmp.toRealPath().resolve("store");
+        AtomicInteger left = new AtomicInteger(Integer.MAX_VALUE);
         BiFunction<Path, FileChannel, FileChannel> wrap = (path, channel) -> {
-            if (path.equals(target) && failNext.getAndSet(false)) {
-                FaultyChannel faulty = new FaultyChannel(channel);
-                faulty.failForces();
-                return faulty;
+            if (path.startsWith(storeDir) || path.startsWith(tmp.resolve("store"))) {
+                return channel; // the store's own files
             }
-            return channel;
+            return new FaultyChannel(channel) {
+                @Override
+                public int write(java.nio.ByteBuffer src) throws IOException {
+                    if (left.decrementAndGet() == 0) {
+                        throw new IOException("injected: write failed");
+                    }
+                    return super.write(src);
+                }
+
+                @Override
+                public void force(boolean metaData) throws IOException {
+                    if (left.decrementAndGet() == 0) {
+                        throw new IOException("injected: force failed");
+                    }
+                    super.force(metaData);
+                }
+            };
         };
         try (Store store = Store.open(tmp.resolve("store"), options(), wrap)) {
+            int failures = 0;
+            for (int n = 1; ; n++) {
+                assertTrue(n < 100, "the snapshot never succeeded");
+                for (int i = 0; i < 50; i++) {
+                    store.put(utf8("k" + n + "-" + i), utf8("v"));
+                }
+                left.set(n);
+                try {
+                    store.snapshot(target, link);
+                } catch (IOException e) {
+                    assertTrue(e.getMessage().startsWith("injected"), e::toString);
+                    assertEquals(List.of("store"), names(tmp), "after failure " + n + ": nothing left");
+                    failures++;
+                    continue;
+                }
+                left.set(Integer.MAX_VALUE);
+                assertTrue(failures >= (link ? 5 : 6), failures + " failure points");
+                try (Store copy = Store.open(target, options())) {
+                    assertEquals(store.lastSequence(), copy.lastSequence());
+                    assertEquals("v", string(copy.get(utf8("k1-0"))).orElseThrow());
+                }
+                return;
+            }
+        }
+    }
+
+    private static List<String> names(Path dir) throws IOException {
+        try (Stream<Path> files = Files.list(dir)) {
+            return files.map(p -> p.getFileName().toString()).sorted().toList();
+        }
+    }
+
+    /**
+     * What a snapshot forces, in order: each copied table, its directory before the manifest is
+     * written, the manifest, its directory after the manifest's rename, and the parent after the
+     * snapshot's rename into place. No test of contents can see a missing force: these can.
+     */
+    @ParameterizedTest(name = "link {0}")
+    @ValueSource(booleans = {true, false})
+    void aSnapshotForcesItsFilesThenItsDirectoryThenItsName(boolean link) throws IOException {
+        List<String> events = new CopyOnWriteArrayList<>();
+        Path parent = tmp.toRealPath();
+        BiFunction<Path, FileChannel, FileChannel> wrap = (path, channel) -> {
+            String name = path.equals(parent) ? "parent"
+                    : path.getFileName().toString().startsWith(".snapshot.snapshot-") ? "building"
+                    : path.getFileName().toString();
+            if (!path.startsWith(parent) || path.startsWith(parent.resolve("store"))) {
+                return channel;
+            }
+            return new FaultyChannel(channel) {
+                @Override
+                public int write(java.nio.ByteBuffer src) throws IOException {
+                    events.add("write " + name);
+                    return super.write(src);
+                }
+
+                @Override
+                public void force(boolean metaData) throws IOException {
+                    events.add("force " + name);
+                    super.force(metaData);
+                }
+            };
+        };
+        try (Store store = Store.open(tmp.resolve("store"), options().withMergeWidth(64), wrap)) {
             for (int i = 0; i < 300; i++) {
                 store.put(utf8("k" + i), utf8("v" + i));
             }
-            failNext.set(true);
-            IOException e = assertThrows(IOException.class, () -> store.snapshot(target));
-            assertTrue(e.getMessage().contains("injected"), e::toString);
-            assertFalse(Files.exists(target), "a failed snapshot is deleted");
-            store.put(utf8("after"), utf8("yes"));
-            Store.Snapshot again = store.snapshot(target);
-            assertEquals(301, again.lastSequence());
+            store.flush(); // and another with the snapshot's flush
+            store.put(utf8("last"), utf8("v"));
+            Store.Snapshot snapshot = store.snapshot(tmp.resolve("snapshot"), link);
+            List<String> tables = new ArrayList<>();
+            for (TableInfo t : store.tables()) {
+                tables.add("force " + Store.tableName(t.number()));
+            }
+            List<String> expected = new ArrayList<>(link ? List.of() : tables);
+            expected.addAll(List.of("force building", "write MANIFEST.tmp", "force MANIFEST.tmp", "force building",
+                    "force parent"));
+            assertEquals(expected, events);
+            assertEquals(store.tables().size(), snapshot.tables());
+            assertTrue(snapshot.tables() >= 2, "tables to copy: " + snapshot.tables());
         }
-        try (Store copy = Store.open(target, options())) {
-            assertEquals("yes", string(copy.get(utf8("after"))).orElseThrow());
+    }
+
+    /**
+     * The snapshot copies its tables outside the write lock, so a merge can replace them meanwhile;
+     * the version it pinned keeps them until it's done. Here a merge runs, and the old tables'
+     * last other reference goes, while the snapshot waits at the force of the first table it
+     * copied: without the pin, the second table's file is gone when its copy starts.
+     */
+    @Test
+    @Timeout(value = 60, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void theTablesASnapshotCopiesSurviveAMergeThatReplacesThem() throws Exception {
+        AtomicReference<FaultyChannel.Gate> gate = new AtomicReference<>();
+        Path parent = tmp.toRealPath();
+        BiFunction<Path, FileChannel, FileChannel> wrap = (path, channel) -> {
+            if (path.startsWith(parent) && !path.startsWith(parent.resolve("store"))
+                    && path.toString().endsWith(Store.TABLE_SUFFIX) && gate.get() == null) {
+                FaultyChannel held = new FaultyChannel(channel);
+                gate.set(held.holdNextForce());
+                return held;
+            }
+            return channel;
+        };
+        Workload workload = new Workload(23, KEYS);
+        try (Store store = Store.open(tmp.resolve("store"), options().withMergeWidth(64), wrap)) {
+            for (long seq = 1; seq <= 600; seq++) {
+                workload.apply(store, seq);
+            }
+            assertTrue(store.tables().size() >= 2, "several tables to copy");
+            AtomicReference<Object> result = new AtomicReference<>();
+            Thread snapshot = Thread.ofPlatform().start(() -> {
+                try {
+                    result.set(store.snapshot(tmp.resolve("snapshot"), false));
+                } catch (Throwable e) {
+                    result.set(e);
+                }
+            });
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (gate.get() == null) {
+                assertTrue(System.nanoTime() < deadline, "the snapshot reached its first copy");
+                Thread.sleep(1);
+            }
+            gate.get().awaitEntered();
+            List<TableInfo> before = store.tables();
+            store.compactAll(); // replaces every table; the old ones are now only the snapshot's
+            assertEquals(1, store.tables().size());
+            for (TableInfo t : before) {
+                assertTrue(Files.exists(store.directory().resolve(Store.tableName(t.number()))), "pinned: still there");
+            }
+            gate.get().open();
+            snapshot.join();
+            assertTrue(result.get() instanceof Store.Snapshot, () -> "the snapshot: " + result.get());
+            for (TableInfo t : before) {
+                assertTrue(!Files.exists(store.directory().resolve(Store.tableName(t.number()))),
+                        "released by the snapshot, the merged-away tables are deleted");
+            }
         }
+        Workload.Model model = new Workload.Model(workload);
+        assertEquals(600, checkSnapshot(tmp.resolve("snapshot"), model));
     }
 
     @Test

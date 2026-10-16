@@ -456,6 +456,15 @@ of the process: the kernel closes its files and releases its POSIX lock, and the
 would in production. What it doesn't do is lose the page cache, so a kill can't show a missing force; those are
 counted (`DurabilityTest`, the order of a snapshot's forces), not killed.
 
+**What about killing the leader, with a follower attached?**
+`LeaderKillTest` kills the real `keystore serve` 8 times while a client writes to it over TCP and a follower
+streams from it, restarting it on the same port each time. Every write the client got an `OK` for is there after
+the restart, and the follower, which reconnects with backoff, never finds itself ahead of the restarted leader or on
+a different history. That's two day-3 rules composing with recovery: a leader ships only acknowledged writes (a tail
+never reads past `lastSequence()`), and an acknowledged write survives a kill. It's an end-to-end check rather than a
+sharp one: since a kill keeps the page cache, a leader that shipped writes before forcing them would pass it too
+(only a power cut could tell, which nothing here does).
+
 **Random kills land mostly in one place. How did you get deaths everywhere?**
 Most of a write's time is its force (3 ms under `EVERY_WRITE` on this Mac), so random deaths mostly hit forces: 17 of
 20 recovered the write in flight. So the child can also kill itself: every channel the store opens is wrapped in a

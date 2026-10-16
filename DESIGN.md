@@ -936,6 +936,13 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
   test checks it got there); otherwise it dies at a random moment while it streams. After each death its store must
   hold exactly the leader's writes up to its own last sequence number, at least the highest the leader saw it
   acknowledge. At the end it catches up, stops on SIGTERM, and matches the leader key for key.
+- **A leader killed with SIGKILL** (`LeaderKillTest`). The real `keystore serve` in a child JVM, on a port kept across
+  restarts, is killed 8 times at a random moment while a client writes to it and a follower streams from it. After
+  each restart the leader holds every write the client got an `OK` for, and at most the one in flight besides (kept
+  by 7 of 8 restarts here: it died forcing it); the follower, which only ever got acknowledged writes, never stops as
+  `AHEAD`, `DIVERGED`, `FAILED` or `BEHIND`, and at the end matches the leader key for key. It checks that the pieces
+  compose; no single mechanism removed fails it alone (a kill keeps the page cache, so even a leader that shipped
+  writes before forcing them would pass).
 - **Snapshots** (`SnapshotTest`, `MainTest`): exactly the writes up to the snapshot's sequence number, with the last
   write's checksum, linked and copied; the source's merges and the snapshot's own don't touch each other; empty
   stores and a store whose tables were all merged away; a target that exists, or is in the store's directory, is

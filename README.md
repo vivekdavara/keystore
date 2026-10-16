@@ -233,6 +233,7 @@ CI runs it on Linux and macOS.
 | **Day 4** | |
 | A child JVM writing to a store is killed with SIGKILL, by the test at random moments (20 a sync policy) and by itself at a chosen write or force until deaths have landed on all seven kinds of step (46 and 36 deaths); after each, exactly the writes up to the store's last sequence number, which is the last acknowledged or the one after | `KillTest` |
 | The real `keystore follow` is killed with SIGKILL 12 times, half of them in the middle of catching up on 20,000 to 60,000 writes; each time its store is exactly a prefix of the leader's, at or past every ack the leader saw | `FollowerKillTest` |
+| The real `keystore serve` is killed with SIGKILL 8 times while a client writes and a follower streams: every write the client got an `OK` for survives, and the follower never finds itself ahead or diverged | `LeaderKillTest` |
 | A snapshot is exactly a prefix, linked or copied; every write and force of one failed in turn leaves nothing; its forces come in order; a merge that replaces its tables mid-copy doesn't hurt it; a `BEHIND` follower starts again from one | `SnapshotTest` |
 | A damaged block fails its read and nothing else; a merge that reaches it stops writes and keeps the manifest; the server's reply says what's wrong; `verify` finds it before any read does | `TableDamageTest`, `MainTest` |
 | The manifest keeps the last write's checksum through flushes and merges; a follower restarted with every write in a table still gets `DIVERGED` from a leader with a different history | `ReplicateTest`, `ReplicationTest`, `ManifestTest` |
@@ -289,7 +290,7 @@ the same store, so flushes and merges are in the numbers.
   second, as day 1's `Bench writes` measured (361).
 
 **The kill tests**, as counts, not timings: the first run of each, at 15:09 and 15:16 at `3088daf` and `b1738fe`
-(`mvn test -Dtest='KillTest,FollowerKillTest'`). The random runs vary from run to run; the chosen steps don't (a
+(`mvn test -Dtest='KillTest,FollowerKillTest'`), and `LeaderKillTest` at 16:03. The random runs vary from run to run; the chosen steps don't (a
 seed fixes the sequence of file operations), and CI's Ubuntu runner counted the same.
 
 | Test | Deaths | Where they landed |
@@ -299,6 +300,7 @@ seed fixes the sequence of file operations), and CI's Ubuntu runner counted the 
 | Chosen steps, `EVERY_WRITE` | 46 | log write 18, log force 19, table write 4, table force 2, manifest write 1, manifest force 1, directory force 1 |
 | Chosen steps, `NEVER` | 36 | log write 15, log force 3, table write 11, table force 3, manifest write 1, manifest force 1, directory force 2 |
 | A follower | 12 | 6 more than 1,000 writes behind its leader, in the middle of catching up (8 in CI's run, and in the review's) |
+| A leader (`LeaderKillTest`, at `fdec6db`) | 8 | all while the client wrote; the write in flight was in the log after 7 of the 8 (it died forcing it) |
 
 The random rows read the directory a death left (approximately: a death just after a merge's manifest, with its
 inputs not yet deleted, counts as a table the manifest doesn't name); the chosen steps are the child's own report.

@@ -12,6 +12,7 @@ import io.github.vivekdavara.keystore.wal.WalFormat;
 import io.github.vivekdavara.keystore.wal.WalRecord;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -177,9 +178,23 @@ class ReplicateTest {
             assertEquals(checksum(batch.get(2)), store.lastChecksum(), "a flush doesn't change it");
         }
         try (Store store = Store.open(dir, options)) {
-            assertEquals(-1, store.lastChecksum(), "every write is in the tables: unknown");
+            assertEquals(checksum(batch.get(2)), store.lastChecksum(), "every write is in the tables: the manifest's");
             store.delete(utf8("a"));
             assertEquals(checksum(WalRecord.delete(5, utf8("a"))), store.lastChecksum());
+            store.compactAll();
+            store.flush();
+            store.compactAll();
+        }
+        try (Store store = Store.open(dir, options)) {
+            assertEquals(5, store.lastSequence());
+            assertEquals(checksum(WalRecord.delete(5, utf8("a"))), store.lastChecksum(), "through flushes and merges");
+        }
+        // A day-2 manifest (version 1) has no checksum: with every write in the tables, it is unknown.
+        Manifest v2 = Manifest.read(dir);
+        Files.write(dir.resolve(Manifest.FILE), ManifestTest.encodeVersion1(v2));
+        try (Store store = Store.open(dir, options)) {
+            assertEquals(5, store.lastSequence());
+            assertEquals(-1, store.lastChecksum(), "a day-2 manifest doesn't know it");
         }
     }
 

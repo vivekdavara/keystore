@@ -23,31 +23,47 @@ import java.util.zip.CRC32C;
  * leaves the old manifest or the new one, never a mix.
  *
  * <pre>
- * magic (8) | next file number (8) | log number (8) | last sequence (8) | table count (4)
+ * magic (8) | next file number (8) | log number (8) | last sequence (8) | last checksum (8)
+ * | table count (4)
  * | per table, newest first: file number (8) | file bytes (8) | smallest seq (8) | largest seq (8)
  * | CRC32C of everything before it (4)
  * </pre>
  *
+ * The last checksum came on day 4 (the magic's last byte is the version, 2); a day-2 manifest,
+ * version 1, has no such field and reads with -1 there.
+ *
  * @param nextFileNumber the next number to give a log or table file
  * @param logNumber the oldest log recovery replays: older logs are covered by tables
  * @param lastSequence the last sequence number the tables cover; the replayed logs start after it
+ * @param lastChecksum the stored checksum of the write {@code lastSequence} names, as an unsigned
+ *     32-bit number, or -1 if unknown (always -1 when {@code lastSequence} is 0). A store whose
+ *     every write is in its tables still knows its last write's checksum from this, for
+ *     {@link Store#lastChecksum()}: a follower's leader checks it (day 3's {@code ERR DIVERGED})
  * @param tables the live tables, newest first, as reads must consult them
  */
-public record Manifest(long nextFileNumber, long logNumber, long lastSequence, List<TableRef> tables) {
+public record Manifest(long nextFileNumber, long logNumber, long lastSequence, long lastChecksum,
+        List<TableRef> tables) {
     static final String FILE = "MANIFEST";
     static final String TEMP_FILE = "MANIFEST.tmp";
-    /** "KSMANIF" and a 1. */
-    static final long MAGIC = 0x4b534d414e494601L;
+    /** "KSMANIF" and a 1: day 2's format, without the last checksum. Still read. */
+    static final long MAGIC_V1 = 0x4b534d414e494601L;
+    /** "KSMANIF" and a 2: the format written since day 4. */
+    static final long MAGIC = 0x4b534d414e494602L;
 
     /** A live table, as the manifest records it; recovery checks the file against it. */
     public record TableRef(long number, long fileBytes, long smallestSeq, long largestSeq) {}
 
     public Manifest {
         tables = List.copyOf(tables);
-        String problem = problem(nextFileNumber, logNumber, lastSequence, tables);
+        String problem = problem(nextFileNumber, logNumber, lastSequence, lastChecksum, tables);
         if (problem != null) {
             throw new IllegalArgumentException(problem);
         }
+    }
+
+    /** A manifest that doesn't know its last write's checksum. */
+    public Manifest(long nextFileNumber, long logNumber, long lastSequence, List<TableRef> tables) {
+        this(nextFileNumber, logNumber, lastSequence, -1, tables);
     }
 
     /** A new store's: no tables, log 1, file numbers from 2. */
@@ -60,9 +76,13 @@ public record Manifest(long nextFileNumber, long logNumber, long lastSequence, L
      * numbers strictly after the next one's, all within the last sequence; numbers are unique and
      * below the next file number.
      */
-    private static String problem(long nextFileNumber, long logNumber, long lastSequence, List<TableRef> tables) {
+    private static String problem(long nextFileNumber, long logNumber, long lastSequence, long lastChecksum,
+            List<TableRef> tables) {
         if (logNumber < 1 || nextFileNumber <= logNumber || lastSequence < 0) {
             return "file numbers " + nextFileNumber + " (next) and " + logNumber + " (log), last sequence " + lastSequence;
+        }
+        if (lastChecksum < -1 || lastChecksum > 0xffffffffL || (lastSequence == 0 && lastChecksum != -1)) {
+            return "last checksum " + lastChecksum + " for last sequence " + lastSequence;
         }
         Set<Long> numbers = new HashSet<>();
         long below = lastSequence + 1;
@@ -80,8 +100,9 @@ public record Manifest(long nextFileNumber, long logNumber, long lastSequence, L
     }
 
     byte[] encode() {
-        ByteBuffer out = ByteBuffer.allocate(8 + 8 + 8 + 8 + 4 + 32 * tables.size() + 4);
-        out.putLong(MAGIC).putLong(nextFileNumber).putLong(logNumber).putLong(lastSequence).putInt(tables.size());
+        ByteBuffer out = ByteBuffer.allocate(8 + 8 + 8 + 8 + 8 + 4 + 32 * tables.size() + 4);
+        out.putLong(MAGIC).putLong(nextFileNumber).putLong(logNumber).putLong(lastSequence).putLong(lastChecksum)
+                .putInt(tables.size());
         for (TableRef t : tables) {
             out.putLong(t.number()).putLong(t.fileBytes()).putLong(t.smallestSeq()).putLong(t.largestSeq());
         }
@@ -99,7 +120,8 @@ public record Manifest(long nextFileNumber, long logNumber, long lastSequence, L
             throw new IOException("the manifest is " + bytes.length + " bytes, too short to be one");
         }
         ByteBuffer in = ByteBuffer.wrap(bytes);
-        if (in.getLong() != MAGIC) {
+        long magic = in.getLong();
+        if (magic != MAGIC && magic != MAGIC_V1) {
             throw new IOException("the manifest doesn't start with the manifest magic");
         }
         int stored = ByteBuffer.wrap(bytes, bytes.length - 4, 4).getInt();
@@ -110,15 +132,16 @@ public record Manifest(long nextFileNumber, long logNumber, long lastSequence, L
             long next = in.getLong();
             long log = in.getLong();
             long last = in.getLong();
+            long lastChecksum = magic == MAGIC ? in.getLong() : -1;
             int count = in.getInt();
-            if (count < 0 || (long) count * 32 != bytes.length - 40L) {
+            if (count < 0 || (long) count * 32 != bytes.length - in.position() - 4L) {
                 throw new IOException("the manifest lists " + count + " tables in " + bytes.length + " bytes");
             }
             List<TableRef> tables = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
                 tables.add(new TableRef(in.getLong(), in.getLong(), in.getLong(), in.getLong()));
             }
-            return new Manifest(next, log, last, tables);
+            return new Manifest(next, log, last, lastChecksum, tables);
         } catch (IllegalArgumentException | BufferUnderflowException e) {
             throw new IOException("the manifest is inconsistent: " + e.getMessage(), e);
         }

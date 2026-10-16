@@ -253,6 +253,45 @@ class ReplicationTest {
         assertEquals(0, secondServer.followers().size());
     }
 
+    /**
+     * The same, with the follower restarted after a flush, so that its last write is in a table and
+     * no log holds it. Day 3's store forgot the write's checksum then, sent a bare {@code SYNC 11},
+     * and streamed on into the second history; since day 4 the manifest keeps it.
+     */
+    @Test
+    void aFollowerRestartedWithEveryWriteInItsTablesStillChecksItsHistory() throws Exception {
+        Store first = Store.open(dir.resolve("leader-1"), leaderOptions());
+        Server firstServer = Server.leader(first, FAST);
+        int port = firstServer.port();
+        for (int i = 1; i <= 10; i++) {
+            first.put(utf8("k" + i), utf8("first-" + i));
+        }
+        Store followerStore = Store.open(dir.resolve("follower"), followerOptions());
+        Follower follower = Follower.start(followerStore, Follower.Config.of(firstServer.address()));
+        await(follower, 10);
+        follower.close();
+        followerStore.flush();
+        long checksum = followerStore.lastChecksum();
+        followerStore.close();
+        firstServer.close();
+        first.close();
+
+        Store restarted = open("follower", followerOptions());
+        assertTrue(restarted.recovery().records() == 0 && restarted.tables().size() == 1, "every write is in a table");
+        assertEquals(checksum, restarted.lastChecksum(), "known from the manifest");
+        Store second = open("leader-2", leaderOptions());
+        for (int i = 1; i <= 12; i++) {
+            second.put(utf8("k" + i), utf8(i <= 5 ? "first-" + i : "second-" + i));
+        }
+        track(Server.leader(second, new Server.Config(
+                new InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), port), 16, Duration.ofMillis(50))));
+        Follower again = track(Follower.start(restarted, Follower.Config.of(firstServer.address())
+                .withTimeout(Duration.ofSeconds(5)).withMaxBackoff(Duration.ofMillis(50))));
+        awaitState(again, State.DIVERGED);
+        assertEquals(10, restarted.lastSequence(), "nothing of the second history was applied");
+        assertArrayEquals(utf8("first-10"), restarted.get(utf8("k10")).orElseThrow());
+    }
+
     @Test
     void syncChecksTheChecksumOfTheWriteBeforeFrom() throws Exception {
         Store leaderStore = open("leader", leaderOptions());

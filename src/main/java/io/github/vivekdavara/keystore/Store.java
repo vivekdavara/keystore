@@ -308,9 +308,11 @@ public final class Store implements Closeable {
                 real.resolve(logName(replay.get(replay.size() - 1))), seq + 1, options.recovery(),
                 replayOne, options.maxLogBytes(), wrap);
         Recovery last = newest.recovery();
-        // The checksum of the last write, if a log still holds it; not if the tables hold every write.
+        // The checksum of the last write: from the log that holds it, or, if the tables hold every
+        // write, from the manifest (day 4; a day-2 manifest doesn't know it).
         long lastChecksum = lastReplayed[0] != null && lastReplayed[0].seq() == last.lastSeq()
-                ? WalFormat.storedChecksum(WalFormat.encode(lastReplayed[0])) : -1;
+                ? WalFormat.storedChecksum(WalFormat.encode(lastReplayed[0]))
+                : manifest.lastSequence() == last.lastSeq() ? manifest.lastChecksum() : -1;
         Recovery recovery = new Recovery(last.outcome(), records + last.records(), last.lastSeq(),
                 last.validBytes(), last.droppedBytes(), last.detail());
 
@@ -673,7 +675,9 @@ public final class Store implements Closeable {
         tables.addAll(before.tables);
         try {
             WriteAheadLog.forceDirectory(dir, wrap);
-            writeManifest(newLog, frozen.lastSequence(), tables);
+            // Under writeLock with no write running, the frozen memtable's last write is the store's.
+            writeManifest(newLog, frozen.lastSequence(), frozen.lastSequence() == lastSeq.get() ? lastChecksum : -1,
+                    tables);
         } catch (IOException | RuntimeException | Error e) {
             table.release(); // its file stays: the manifest on the device may name it
             throw e;
@@ -703,14 +707,19 @@ public final class Store implements Closeable {
         }
     }
 
-    private void writeManifest(long logNumber, long lastSequence, List<Table> tables) throws IOException {
+    private void writeManifest(long logNumber, long lastSequence, long lastChecksum, List<Table> tables)
+            throws IOException {
+        Manifest next = new Manifest(nextFileNumber, logNumber, lastSequence, lastChecksum, refs(tables));
+        next.write(dir, wrap);
+        manifest = next;
+    }
+
+    private static List<Manifest.TableRef> refs(List<Table> tables) {
         List<Manifest.TableRef> refs = new ArrayList<>(tables.size());
         for (Table t : tables) {
             refs.add(new Manifest.TableRef(t.number(), t.fileBytes(), t.smallestSeq(), t.largestSeq()));
         }
-        Manifest next = new Manifest(nextFileNumber, logNumber, lastSequence, refs);
-        next.write(dir, wrap);
-        manifest = next;
+        return refs;
     }
 
     private static void deleteQuietly(Path file) {
@@ -805,7 +814,7 @@ public final class Store implements Closeable {
             if (output != null) {
                 WriteAheadLog.forceDirectory(dir, wrap);
             }
-            writeManifest(manifest.logNumber(), manifest.lastSequence(), result);
+            writeManifest(manifest.logNumber(), manifest.lastSequence(), manifest.lastChecksum(), result);
         } catch (IOException | RuntimeException | Error e) {
             if (output != null) {
                 output.release(); // its file stays: the manifest on the device may name it
@@ -950,7 +959,8 @@ public final class Store implements Closeable {
     /**
      * The checksum the record {@link #lastSequence()} names was stored with, as an unsigned 32-bit
      * number ({@link WalFormat#storedChecksum}), or -1 if this store doesn't know it: a new store, or
-     * one opened with every write in its tables. With the sequence number, it identifies the last
+     * one opened with every write in its tables under a day-2 manifest (since day 4 the manifest
+     * keeps it, so a flush doesn't lose it). With the sequence number, it identifies the last
      * write well enough for a follower to show its leader that their histories match. Consistent
      * with {@link #lastSequence()} when no write runs at the same time (a follower reads both on the
      * thread that makes its writes).

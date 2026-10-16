@@ -571,9 +571,9 @@ replies, JMH), about 15 minutes, found three more, each with a test that failed 
 
 From its notes: `verify` exited 1, not 3, on a damaged manifest (now 3); after a merge reached a damaged block, write
 replies were cut off before they named the table (now the short form too); and tests now cover kept logs and a table
-that doesn't match the manifest's record. Three of `verify`'s checks still have no test that fails without them (the
-tombstone count, the per-entry sequence range and the point lookup): making a table that passes its checksums but
-breaks one of them needs a table writer that lies.
+that doesn't match the manifest's record. Three of `verify`'s checks had no test that failed without them (the
+tombstone count, the per-entry sequence range and the point lookup); `TableSurgery` now makes tables that pass every
+checksum but lie in each of those ways, and with each check removed its own case fails.
 
 Found while building, before the review: the server's reply to a damaged read was cut at the protocol's 128-byte line
 limit by the table's path, before it said what was wrong (`TableDamageTest`); it now names the file alone. And CI

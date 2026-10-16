@@ -11,6 +11,7 @@ import io.github.vivekdavara.keystore.server.Protocol.ErrorCode;
 import io.github.vivekdavara.keystore.server.Server;
 import io.github.vivekdavara.keystore.server.ServerException;
 import io.github.vivekdavara.keystore.sstable.CorruptTableException;
+import io.github.vivekdavara.keystore.sstable.TableSurgery;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
@@ -21,6 +22,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Damage in a table's data block, found by the store while it runs. A store checks a table's
@@ -160,6 +163,50 @@ class TableDamageTest {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         assertEquals(1, StoreCheck.verify(dir, new PrintStream(out, true, StandardCharsets.UTF_8)));
         assertTrue(out.toString(StandardCharsets.UTF_8).contains("doesn't match the manifest's record of it"), out::toString);
+    }
+
+    /**
+     * Tables that pass every checksum but lie, made by {@link TableSurgery}: a footer with a wrong
+     * tombstone count, a footer whose sequence range leaves out an entry (with the manifest's
+     * record changed to match, so that check passes), and a Bloom filter that holds no key. Only
+     * verify's own checks can find these; the second review found none of the three tested.
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"tombstones", "range", "filter"})
+    void verifyFindsATableThatPassesItsChecksumsButLies(String lie) throws IOException {
+        try (Store store = Store.open(dir, options())) {
+            twoTables(store);
+        }
+        Manifest m = Manifest.read(dir);
+        Manifest.TableRef newest = m.tables().get(0);
+        Path file = dir.resolve(Store.tableName(newest.number()));
+        String expected;
+        switch (lie) {
+            case "tombstones" -> {
+                TableSurgery.rewriteFooter(file, 1, newest.smallestSeq(), newest.largestSeq());
+                expected = "0 tombstones, but the footer says 1";
+            }
+            case "range" -> {
+                TableSurgery.rewriteFooter(file, 0, newest.smallestSeq() + 1, newest.largestSeq());
+                java.util.List<Manifest.TableRef> refs = new java.util.ArrayList<>(m.tables());
+                refs.set(0, new Manifest.TableRef(newest.number(), newest.fileBytes(), newest.smallestSeq() + 1,
+                        newest.largestSeq()));
+                new Manifest(m.nextFileNumber(), m.logNumber(), m.lastSequence(), m.lastChecksum(), refs)
+                        .write(dir, (path, channel) -> channel);
+                expected = "an entry with sequence number " + newest.smallestSeq() + ", outside the table's";
+            }
+            default -> {
+                TableSurgery.emptyTheFilter(file);
+                expected = "doesn't find it";
+            }
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        assertEquals(1, StoreCheck.verify(dir, new PrintStream(out, true, StandardCharsets.UTF_8)), out::toString);
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertTrue(report.startsWith(file.getFileName() + ": DAMAGED: ") && report.contains(expected), report);
+        try (Store store = Store.open(dir, options())) { // it opens: nothing at open looks this far
+            assertEquals(2_000, store.lastSequence());
+        }
     }
 
     /** {@link StoreCheck} reads every block, so it finds damage no read has reached; a clean store passes. */

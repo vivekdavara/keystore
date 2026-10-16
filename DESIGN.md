@@ -959,8 +959,10 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
 - **Damage** (`TableDamageTest`, `MainTest`): a flipped byte in a live table's block fails the read of that block
   and nothing else; a merge that reaches it fails the store and leaves the manifest; the server's replies, to the
   read and to later writes, say what is wrong; `verify` finds damage in a block no read has reached, a table that
-  doesn't match the manifest's record, and a damaged manifest, and passes a clean store and one keeping logs for
-  followers; `dump` and reads elsewhere don't see block damage.
+  doesn't match the manifest's record, a damaged manifest, and tables that pass every checksum but lie (a footer's
+  tombstone count, a sequence range that leaves an entry out, a Bloom filter that holds no key: `TableSurgery`), and
+  passes a clean store and one keeping logs for followers; `dump` and reads elsewhere don't see block damage. With
+  each of verify's three content checks removed in a copy, its own case fails.
 - **The second review's tests**: `SnapshotInsideTheStoresDirectoryTest` (a firmlinked path, run where there is one;
   a missing parent named `MANIFEST.tmp`), `SnapshotTargetWithALongNameTest`,
   `VerifyCountsAnIntactLogAfterADamagedOneTest`.
@@ -1056,6 +1058,5 @@ Day 4's:
 - **`keystore verify` reads the whole store**, and takes no lock: on a running store (a running follower's too), a
   merge can delete a table it is about to read, which it then reports as missing, and a flush between its reading
   the manifest and listing the logs can make a good log look out of sequence. Run it on a stopped store or a
-  snapshot. Three of its checks (the tombstone count, the per-entry sequence range, the point lookup) have no test
-  that fails without them: a table that passes its checksums but breaks one needs a table writer that lies.
+  snapshot.
 - **No repair.** A damaged table's writes are lost unless a follower or a snapshot taken before the damage has them.

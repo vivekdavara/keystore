@@ -1,5 +1,6 @@
 package io.github.vivekdavara.keystore.cli;
 
+import io.github.vivekdavara.keystore.About;
 import io.github.vivekdavara.keystore.Bytes;
 import io.github.vivekdavara.keystore.Options;
 import io.github.vivekdavara.keystore.Store;
@@ -40,6 +41,7 @@ import java.util.concurrent.CountDownLatch;
  *                               keep DIR a copy of the leader's, and serve reads on PORT
  * keystore client HOST:PORT put KEY VALUE | get KEY | delete KEY | info
  *                               one request to a server; put and delete print the sequence number
+ * keystore version              this build's version, and the file formats it writes and reads
  * </pre>
  *
  * Exit status: 0 done, 1 not found or an error, 2 usage, 3 the log is damaged so that a store
@@ -61,7 +63,8 @@ public final class Main {
             "       keystore snapshot DIR TARGET",
             "       keystore serve DIR PORT",
             "       keystore follow DIR PORT LEADER_HOST:PORT",
-            "       keystore client HOST:PORT put KEY VALUE | get KEY | delete KEY | info");
+            "       keystore client HOST:PORT put KEY VALUE | get KEY | delete KEY | info",
+            "       keystore version");
 
     /** The flushed log a leader started by {@code serve} keeps for its followers. */
     static final long SERVE_RETAIN_LOG_BYTES = 64L << 20;
@@ -234,10 +237,24 @@ public final class Main {
         }
     }
 
+    /**
+     * {@code keystore 1.0.0 (Java 21.0.12)}, then the formats: {@code table format 1; manifest
+     * format 2, reads 1 to 2}.
+     */
+    static String version() {
+        return String.format("keystore %s (Java %s)%ntable format %d; manifest format %d, reads %d to %d",
+                About.version(), System.getProperty("java.version"), About.TABLE_FORMAT, About.MANIFEST_FORMAT,
+                About.OLDEST_MANIFEST_FORMAT, About.MANIFEST_FORMAT);
+    }
+
     static int run(String[] args, PrintStream out, PrintStream err) {
         String command = args.length > 0 ? args[0] : "";
         if (command.equals("client")) {
             return client(args, out, err);
+        }
+        if (command.equals("version") && args.length == 1) {
+            out.println(version());
+            return 0;
         }
         int arity = switch (command) {
             case "put" -> 4;

@@ -13,10 +13,14 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.io.RandomAccessFile;
 import java.net.ServerSocket;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -81,6 +85,39 @@ class MainTest {
         assertTrue(err.startsWith("keystore: no store at"), err);
         assertEquals(1, run("flush", dir.resolve("nowhere").toString()));
         assertFalse(Files.exists(dir.resolve("nowhere")), "only a write creates a store");
+    }
+
+    /**
+     * {@code version} names the pom's version (Maven filled it into the build's resources), and the
+     * format numbers it prints are the ones in the files a store writes: a table's footer (its
+     * version is the 4 bytes before the checksum and magic at the end) and the manifest's magic (the
+     * version is its last byte).
+     */
+    @Test
+    void versionIsThePomsAndItsFormatsAreTheFilesOnDisk() throws IOException {
+        assertEquals(0, run("version"));
+        String[] lines = out.split("\n");
+        assertEquals(2, lines.length, out);
+        Matcher pom = Pattern.compile("<artifactId>keystore</artifactId>\\s*<version>([^<]+)</version>")
+                .matcher(Files.readString(Path.of("pom.xml"), StandardCharsets.UTF_8));
+        assertTrue(pom.find());
+        assertEquals("keystore " + pom.group(1) + " (Java " + System.getProperty("java.version") + ")", lines[0]);
+
+        String d = dir.toString();
+        assertEquals(0, run("put", d, "city", "Boston"));
+        assertEquals(0, run("flush", d));
+        Path table;
+        try (Stream<Path> files = Files.list(dir)) {
+            table = files.filter(f -> f.toString().endsWith(".sst")).findFirst().orElseThrow();
+        }
+        byte[] tableBytes = Files.readAllBytes(table);
+        int tableFormat = ByteBuffer.wrap(tableBytes, tableBytes.length - 16, 4).getInt();
+        byte[] manifest = Files.readAllBytes(dir.resolve("MANIFEST"));
+        int manifestFormat = manifest[7];
+        assertEquals("table format " + tableFormat + "; manifest format " + manifestFormat + ", reads 1 to "
+                + manifestFormat, lines[1]);
+
+        assertEquals(2, run("version", "extra"));
     }
 
     @Test

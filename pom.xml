@@ -6,7 +6,7 @@
 
     <groupId>io.github.vivekdavara</groupId>
     <artifactId>keystore</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>1.0.0-SNAPSHOT</version>
     <name>keystore</name>
     <description>LSM-tree key-value store with a write-ahead log, SSTables and replication</description>
 
@@ -47,6 +47,13 @@
     <build>
         <!-- target/keystore.jar whatever the version, so scripts don't have to know it. -->
         <finalName>${project.artifactId}</finalName>
+        <resources>
+            <!-- keystore.properties gets the project's version (About.version, keystore version). -->
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

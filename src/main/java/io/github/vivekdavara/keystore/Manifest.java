@@ -49,6 +49,10 @@ public record Manifest(long nextFileNumber, long logNumber, long lastSequence, l
     static final long MAGIC_V1 = 0x4b534d414e494601L;
     /** "KSMANIF" and a 2: the format written since day 4. */
     static final long MAGIC = 0x4b534d414e494602L;
+    /** The format version written: the magic's last byte. */
+    static final int FORMAT = (int) (MAGIC & 0xff);
+    /** The oldest format version read. */
+    static final int OLDEST_FORMAT = (int) (MAGIC_V1 & 0xff);
 
     /** A live table, as the manifest records it; recovery checks the file against it. */
     public record TableRef(long number, long fileBytes, long smallestSeq, long largestSeq) {}

@@ -31,6 +31,9 @@ import java.util.function.BiFunction;
  * reopens it ({@link #reopen}); the interrupted read itself still fails.
  */
 public final class Table {
+    /** The format version this build writes into a table's footer, and the only one it reads. */
+    public static final int FORMAT_VERSION = TableFormat.VERSION;
+
     private final Path file;
     private final long number;
     private final BiFunction<Path, FileChannel, FileChannel> wrap;

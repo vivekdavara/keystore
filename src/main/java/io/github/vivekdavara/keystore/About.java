@@ -26,7 +26,8 @@ public final class About {
 
     /**
      * The project's version ({@code 1.0.0}), which Maven writes into {@code keystore.properties} when
-     * it copies the resources; "unknown" for classes compiled some other way.
+     * it copies the resources; "unknown" for classes built some other way (no resource, or one
+     * copied without Maven's filtering, which still says {@code ${project.version}}).
      */
     public static String version() {
         try (InputStream in = About.class.getResourceAsStream(RESOURCE)) {
@@ -35,7 +36,8 @@ public final class About {
             }
             Properties properties = new Properties();
             properties.load(in);
-            return properties.getProperty("version", "unknown");
+            String version = properties.getProperty("version", "unknown");
+            return version.startsWith("${") ? "unknown" : version;
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

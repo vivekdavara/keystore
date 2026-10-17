@@ -14,7 +14,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * The medians of {@code scripts/bench.sh}'s output, which the release check prints at its end. Lines
+ * The medians of {@code scripts/bench.sh}'s output, which the release check writes to
+ * {@code bench-medians.txt}. Lines
  * are grouped by what comes before their first ": " (the benchmark and its parameters), in the order
  * the groups first appear; each number after it is replaced by its median over the group's runs, with
  * the range in brackets when the runs differ.

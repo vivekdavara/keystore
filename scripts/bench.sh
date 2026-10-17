@@ -41,7 +41,10 @@ if [ "$day" = all ] || [ "$day" = 2 ]; then
 fi
 
 for _ in $(seq "$runs"); do bench writes EVERY_WRITE 1000 100; done
-for _ in $(seq "$runs"); do bench writes NEVER 200000 100; done
+if [ "$day" != all ]; then
+    # Day 2's block runs the same; twice would make its median one of twice the runs.
+    for _ in $(seq "$runs"); do bench writes NEVER 200000 100; done
+fi
 for _ in $(seq "$runs"); do bench recover 1000000 100; done
 for _ in $(seq "$runs"); do bench scan 67108864 zeros; done
 for _ in $(seq "$runs"); do bench scan 67108864 random; done

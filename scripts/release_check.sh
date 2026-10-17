@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # The release check (README, "Release check"): what CI runs, the same again on a clean export of the commit (so it
 # needs nothing that isn't committed), the packaged command and the replication demo, then every measurement in the
-# README's "Results" again at this commit (scripts/bench.sh 5 and scripts/jmh.sh), and the kill tests with their
-# counts. Each step's output goes to target/release/<time>/<step>.txt; the check stops at the first step that fails,
-# and ends with the medians of the bench runs (bench-medians.txt).
+# README's "Results" again at this commit (scripts/bench.sh 5, with the medians of its runs in bench-medians.txt, and
+# scripts/jmh.sh), and the kill tests with their counts. Each step's output goes to target/release/<time>/<step>.txt;
+# the check stops at the first step that fails.
 #
 #   scripts/release_check.sh          all of it (about 25 minutes on an M3)
 #   scripts/release_check.sh quick    the two test runs, the packaged command and the demo (about 6 minutes)
 #
 # The measurements need a quiet machine (nothing else using the CPU or the disk), and ports 8104 and 8105 free.
-# conditions-start.txt and conditions-end.txt record the machine: the commit, the build, the CPU, the OS, the power
-# and the load average.
+# conditions-start.txt and conditions-end.txt record the machine: the commit, the CPU, the OS, the power and the load
+# average; version.txt is the build's `keystore version`, once the check has built it.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -34,11 +34,10 @@ step() {
 conditions() {
   date
   echo "commit $(git rev-parse HEAD) ($(git describe --tags --always --dirty))"
-  if [ -f target/keystore.jar ]; then scripts/keystore version; fi
   if command -v sysctl >/dev/null && sysctl -n machdep.cpu.brand_string >/dev/null 2>&1; then
     sysctl -n machdep.cpu.brand_string
     sw_vers -productVersion
-    pmset -g batt | head -2
+    pmset -g batt | sed -n 1,2p # sed reads it all: head could end the pipe early, which pipefail would fail
     pmset -g | grep -i lowpowermode || true
   else
     grep -m1 'model name' /proc/cpuinfo || true
@@ -51,13 +50,18 @@ echo "release check of $(git rev-parse --short=12 HEAD) ($(git describe --tags -
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   echo "warning: tracked files have changes: the clean export checks the commit, every other step the working tree"
 fi
+if grep -q -m1 -- '-SNAPSHOT</version>' pom.xml; then
+  echo "warning: pom.xml's version is a SNAPSHOT; a release commit sets the release's version"
+fi
 conditions >"$dir/conditions-start.txt" 2>&1
 
 export_dir="$(mktemp -d)"
-trap 'rm -rf "$export_dir"' EXIT
+# On the way out, keep the clean export's test reports if it left any (a failed run's are the useful ones).
+trap 'cp -R "$export_dir/target/surefire-reports" "$dir/clean-export-reports" 2>/dev/null; rm -rf "$export_dir"' EXIT
 git archive HEAD | tar -x -C "$export_dir"
 
 step check mvn -B verify
+step version scripts/keystore version
 step clean-export mvn -B -f "$export_dir/pom.xml" verify
 step smoke scripts/smoke.sh
 step replication-demo scripts/replication-demo.sh

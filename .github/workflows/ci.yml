@@ -9,8 +9,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pinned, so a release's run is on the images every earlier run used (ubuntu-latest moves to 26.04 from
-        # Oct 19, 2026). macos-26 is what macos-latest has been.
+        # Pinned, so a release's run is on the images earlier runs used (ubuntu-latest and macos-latest gave
+        # these to day 1's first run, one on day 2 and day 4's last); ubuntu-latest moves to 26.04 from Oct 19, 2026.
         os: [ubuntu-24.04, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15

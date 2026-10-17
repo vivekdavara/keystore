@@ -13,11 +13,13 @@ write-ahead log and recovery, and `put`/`get`/`delete` on top of them. Day 2 add
 (SSTables) with a sparse index and a Bloom filter, the flush that writes them, a manifest, reads across the memtable
 and the tables, and size-tiered compaction. Day 3 added a TCP server with a small text protocol, and leader-follower
 replication: the leader ships its log records, read from its own log files, and a follower applies them with the
-leader's sequence numbers and catches up from its own last one after any break. Day 4 (this version) tests all of it
-with real process deaths (a writer and a follower killed with SIGKILL, again and again), adds snapshots (a copy of the
-store as of one sequence number, made of hard links to its tables, which a follower that fell too far behind can
-start from), keeps the last write's checksum in the manifest, finds damage in tables before a read does (`keystore
-verify`), and measures reads, writes and the Bloom filter with JMH.
+leader's sequence numbers and catches up from its own last one after any break. Day 4 tested all of it with real
+process deaths (a writer and a follower killed with SIGKILL, again and again), added snapshots (a copy of the store
+as of one sequence number, made of hard links to its tables, which a follower that fell too far behind can start
+from), kept the last write's checksum in the manifest, found damage in tables before a read does (`keystore
+verify`), and measured reads, writes and the Bloom filter with JMH. Day 5 is the release, v1.0.0: what its files
+promise to later versions, a clear refusal of files a later version wrote, and a release check that runs every test
+and measurement again at the release's commit.
 
 ## Contents
 
@@ -38,6 +40,7 @@ verify`), and measures reads, writes and the Bloom filter with JMH.
 - [Replication (day 3)](#replication-day-3)
 - [Snapshots (day 4)](#snapshots-day-4)
 - [Damage found while running (day 4)](#damage-found-while-running-day-4)
+- [The release (day 5)](#the-release-day-5)
 - [Testing](#testing)
 - [Plan for days 3–5](#plan-for-days-35)
 - [Limitations](#limitations)
@@ -793,6 +796,65 @@ There is no repair: a damaged table's writes are lost unless a follower or a sna
 read its leader's tables (it streams the log), so damage in a leader's table doesn't reach it; a snapshot links the
 table as it is, damage and all, and `verify` checks a snapshot like any store.
 
+## The release (day 5)
+
+v1.0.0 adds no storage mechanism. Day 5 is about what the release promises, and how it was checked.
+
+### The files, and later versions
+
+`keystore version` prints the formats this build writes and reads (`About`):
+
+| File | How a reader knows its format | v1.0.0 writes | v1.0.0 reads |
+|---|---|---|---|
+| A table (`000005.sst`) | the last byte of the footer's magic (`KSTABLE` and a 1), and the footer's version field, which the footer's checksum covers | 1 | 1 |
+| The manifest | the last byte of its magic (`KSMANIF` and a 2) | 2 | 1 (day 2's, without the last write's checksum) and 2 |
+| A log (`000004.log`) | nothing: a record has no version field | the records in `WalFormat` | the same |
+| The protocol | nothing: there is no handshake | | |
+
+**A file from a later version is refused by name, and the open changes nothing.** A manifest whose magic is `KSMANIF`
+with another number, or a table whose magic or version field says a format other than 1, refuses the open with
+`manifest format 3, which this build doesn't read (it reads 1 to 2): written by a later version of keystore, or
+damaged` (or `table format 2, ...`). Both were refused before day 5 too, but as "the manifest doesn't start with the
+manifest magic" and "format version 2, not 1". The format is checked before anything else in the file is read, since
+a later format may lay the rest out differently; "or damaged" because a flipped bit in that byte looks the same.
+What matters more than the message is when the refusal comes: before recovery truncates a log, writes a manifest or
+deletes anything (`LaterFormatTest` compares the bytes of every file but the lock before and after). An open that went on would delete,
+as garbage, any file the later version's manifest names and this one's doesn't.
+
+**What a later format change has to do**, to keep that true:
+
+- **A table or the manifest:** a new format number, so that this build refuses the file rather than misreading it.
+  A new kind of file in the store's directory needs a new manifest format as well, because this build's open deletes
+  any file its manifest doesn't account for.
+- **A log record:** it carries no version, and nothing in a log's bytes says which format wrote them, so a new
+  record format needs a new file name (say `000004.wal`): recovery would replay old logs with the old decoder until a
+  flush covers them. Replication ships records exactly as the leader's log holds them, so a follower must read its
+  leader's format: upgrade followers first.
+- **The protocol:** an unknown command gets `ERR PROTOCOL unknown command "FROB"` and the connection is closed, so a
+  new command is safe to add and a client can tell it is talking to an older server. `SYNC` has no version of its own,
+  which is one more reason for the log rule above.
+
+### The release check
+
+`scripts/release_check.sh` (and `quick`, its first four steps) runs, stopping at the first failure:
+
+| Step | What | Why |
+|---|---|---|
+| `check` | `mvn -B verify`, as CI runs it | |
+| `clean-export` | the same on `git archive HEAD`, in a temporary directory | the tests read `README.md` and `pom.xml`, and the build filters `src/main/resources`: a file that exists only in this working tree would pass `check` and fail for anyone who clones |
+| `smoke` | `scripts/smoke.sh`: the packaged jar's commands on a fresh store, `version` to `snapshot` | what a user runs; CI runs it too |
+| `replication-demo` | `scripts/replication-demo.sh`: a packaged leader and follower | the same, for the servers |
+| `bench`, `bench-medians` | `scripts/bench.sh 5`, then the median and range of each number (`Medians`) | the README's tables are the release's own, not day 1's to day 4's |
+| `jmh` | `scripts/jmh.sh` with the settings of day 4's reads and writes (2 forks, 3 warm-up and 5 measured iterations of 1 s; day 4's snapshot numbers had 2 warm-ups) | the same |
+| `kill-tests` | `KillTest`, `FollowerKillTest`, `LeaderKillTest`, with their counts | the deaths are random, so their counts are the release's too |
+
+Each step's output is kept in `target/release/<time>/`, with the machine's conditions (commit, build, CPU, OS, power,
+load average) at the start and the end, since every number depends on them.
+
+**CI** runs on pinned images, `ubuntu-24.04` and `macos-26`: what `ubuntu-latest` and `macos-latest` gave the runs
+checked (day 1's first, one on day 2, day 4's last). `ubuntu-latest` moves to 26.04 from Oct 19, 2026, and a
+release's CI run shouldn't change platform under it.
+
 ## Testing
 
 Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, compaction) come after them, then day
@@ -977,6 +1039,20 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
   force, nor a follower acknowledging a batch it hasn't forced. The forces are counted (`DurabilityTest`, and the
   order of a snapshot's), not power-cut.
 
+**Day 5's tests:**
+
+- **Later formats** (`LaterFormatTest`, `ManifestTest`, `TableTest`): a manifest whose magic ends in a 3 and a table
+  whose footer says format 2 (each checksum recomputed, as a later build would write it), or whose magic ends in a 2,
+  are refused by name; the store's open is refused and every file's bytes are unchanged. With day 4's
+  `Manifest.decode` and `TableFormat.decodeFooter` put back, all four fail.
+- **`keystore version`** (`MainTest`): its first line names `pom.xml`'s version, so Maven's filtering ran, and its
+  format numbers are the ones in the bytes a store writes (a flushed table's footer, the manifest's magic).
+- **The README's examples** (`ReadmeTest`): `verify`, `snapshot` and `version` print what "Run it" shows, as the first
+  five commands did. In a copy of the README, a wrong byte count in the snapshot line, a wrong sequence range in
+  verify's report, a wrong oldest manifest format and a wrong value read from the snapshot each fail a test.
+- **`Medians`** (`MediansTest`): medians and ranges per benchmark, in order; labels such as "p99.9" aren't numbers;
+  an even number of runs; runs whose words differ are refused.
+
 ## Plan for days 3–5
 
 - **Day 3 (done): the server and replication.** A TCP server with a small line-based text protocol (`PUT`, `GET`,
@@ -987,7 +1063,8 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
   `keystore verify`; snapshots, from which a `BEHIND` follower starts again; the manifest keeps the last write's
   checksum; JMH benchmarks of writes, reads and the Bloom filter. Not done: group commit, flushes and merges off the
   writer's thread (below), and a `SNAPSHOT` command in the protocol.
-- **Day 5:** README with results, WALKTHROUGH.md, v1.0.0.
+- **Day 5 (done): the release.** README with results measured at the release's commit, WALKTHROUGH.md, CHANGELOG.md,
+  the release check, `keystore version`, refusing files from later versions, v1.0.0.
 
 ## Limitations
 

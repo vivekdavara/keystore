@@ -12,4 +12,6 @@ cp="target/test-classes:target/classes:$(cat target/jmh-classpath.txt)"
 if [ $# -eq 0 ]; then
     set -- -f 2 -wi 3 -w 1s -i 5 -r 1s -rf json -rff target/jmh-result.json
 fi
-exec "$JAVA_HOME/bin/java" -cp "$cp" org.openjdk.jmh.Main "$@"
+# -foe true: a benchmark that throws fails the run. Without it JMH prints <failure> and exits 0, so neither CI's
+# smoke run nor the release check could fail on a broken benchmark (the release review found it).
+exec "$JAVA_HOME/bin/java" -cp "$cp" org.openjdk.jmh.Main -foe true "$@"

@@ -14,9 +14,10 @@ test "$("$keystore" get "$store" city)" = Boston
 "$keystore" delete "$store" city
 "$keystore" flush "$store"
 "$keystore" compact "$store"
-# A deleted key is "not found" (exit 1), which an error would also exit with: check which.
+# A deleted key is "not found" (exit 1), which an error would also exit with: check which. The last line, since a
+# JVM can print a notice first ("Picked up JAVA_TOOL_OPTIONS").
 if out="$("$keystore" get "$store" city 2>&1)"; then echo "city should be deleted" >&2; exit 1; fi
-test "$out" = "keystore: city: not found"
+[[ "$out" == *"keystore: city: not found" ]]
 "$keystore" dump "$store"
 "$keystore" verify "$store"
 rm -rf "$store-snapshot"

@@ -56,8 +56,9 @@ fi
 conditions >"$dir/conditions-start.txt" 2>&1
 
 export_dir="$(mktemp -d)"
-# On the way out, keep the clean export's test reports if it left any (a failed run's are the useful ones).
-trap 'cp -R "$export_dir/target/surefire-reports" "$dir/clean-export-reports" 2>/dev/null; rm -rf "$export_dir"' EXIT
+# On the way out, keep the clean export's test reports if it left any (a failed run's are the useful ones). The
+# `|| true` matters: under set -e a failing command stops a trap, which would skip the removal and fail the script.
+trap 'cp -R "$export_dir/target/surefire-reports" "$dir/clean-export-reports" 2>/dev/null || true; rm -rf "$export_dir"' EXIT
 git archive HEAD | tar -x -C "$export_dir"
 
 step check mvn -B verify

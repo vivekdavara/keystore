@@ -177,7 +177,9 @@ public final class Store implements Closeable {
      * manifest's tables are opened and checked, and the logs it doesn't cover are replayed;
      * {@link #recovery()} says what recovery found. Files the manifest doesn't account for (an
      * unfinished flush's table, a compaction's inputs, logs the tables cover) are deleted, once
-     * recovery has succeeded; a refused open changes nothing.
+     * recovery has succeeded. A refused open changes no file, but it may have created the empty
+     * {@code LOCK} file it locks first. That file is never deleted: a process that opened it just
+     * before a deletion could lock the deleted file while another locks a new one.
      *
      * @throws StoreLockedException if the directory is open in another store
      * @throws io.github.vivekdavara.keystore.wal.WalCorruptionException if a log is damaged in a

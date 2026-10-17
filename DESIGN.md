@@ -432,8 +432,11 @@ and merges another 2.22, 3.37 in all, on top of the log itself, the same in ever
    recovered its one log (below), torn tail and all.
 4. Only then delete what the manifest doesn't account for: logs below its log number (their writes are in tables),
    except the newest of them that `Options.retainLogBytes` keeps for followers (day 3); tables it doesn't list (an
-   unfinished flush's, or a merge's inputs); and `MANIFEST.tmp`. A refused open changes nothing. Kept logs are
-   never replayed: the tables cover them.
+   unfinished flush's, or a merge's inputs); and `MANIFEST.tmp`. A refused open changes no file, though it may have
+   created the empty `LOCK` file, which it locks before anything else. That file is never deleted, even by a refused
+   open that created it: a process that had opened it just before the deletion could then lock the deleted file
+   while another locks a new one, and both would open the store. Kept logs are never replayed: the tables cover
+   them.
 
 Normally there is one log to replay. There are two after a crash during a flush, before the manifest named the new
 table: the old log and the new one.
@@ -811,7 +814,7 @@ v1.0.0 adds no storage mechanism. Day 5 is about what the release promises, and 
 | A log (`000004.log`) | nothing: a record has no version field | the records in `WalFormat` | the same |
 | The protocol | nothing: there is no handshake | | |
 
-**A file from a later version is refused by name, and the open changes nothing.** A manifest whose magic is `KSMANIF`
+**A file from a later version is refused by name, and the open changes no file.** A manifest whose magic is `KSMANIF`
 with another number, or a table whose magic or version field says a format other than 1, refuses the open with
 `manifest format 3, which this build doesn't read (it reads 1 to 2): written by a later version of keystore, or
 damaged` (or `table format 2, ...`). Both were refused before day 5 too, but as "the manifest doesn't start with the

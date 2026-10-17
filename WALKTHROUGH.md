@@ -3,8 +3,8 @@
 Questions an interviewer is likely to ask about this project, with short answers grounded in the code. Each answer
 names the file or test to open. Day 1 covered the memtable, the write-ahead log, recovery and the store; day 2 added
 tables, the flush, the manifest, versions and compaction ("Tables and compaction", below); day 3 added the server
-and replication ("The server and replication"); day 4 adds crash tests with killed processes, snapshots, damage
-found while running, and JMH ("Failure and measurement", below).
+and replication ("The server and replication"); day 4 added crash tests with killed processes, snapshots, damage
+found while running, and JMH ("Failure and measurement"); day 5 is the v1.0.0 release ("The release", below).
 
 **Reading order:** DESIGN.md "Write path" and "Recovery" → `Store.write` → `memtable/SkipList.put` →
 `wal/WalFormat` (the table at the top) → `wal/WalReader.read` → `StoreFaultTest` and `StoreLockTest`. For day 2:
@@ -16,7 +16,9 @@ top) → `server/Server.serve`, `answer`, `ship`, `checkHistory` → `LogTail.re
 `FollowerStreamTest` and `FollowerCrashCycleTest`. For day 4: DESIGN.md "Snapshots", "Damage found while running"
 and "Day 4's tests" → `Workload` → `KillTarget` (`KillSwitch`, `die`) → `KillTest` (`Child`, `check`) →
 `FollowerKillTest` → `Store.snapshot` (and `link`, `deleteTree`) → `Manifest` (the checksum, and `decode` of version
-1) → `StoreCheck.verify` → `SnapshotTest` and `TableDamageTest` → `jmh/ReadBenchmark`.
+1) → `StoreCheck.verify` → `SnapshotTest` and `TableDamageTest` → `jmh/ReadBenchmark`. For day 5: DESIGN.md "The
+release" → `About` → `Manifest.decode` and `sstable/TableFormat.decodeFooter` (the format checks) →
+`LaterFormatTest` → `scripts/release_check.sh` → `bench/Medians` → `cli/ReadmeTest` → CHANGELOG.md.
 
 ## The big picture
 
@@ -546,6 +548,63 @@ For day 3's divergence check. A follower proves where its history ends by sendin
 with `SYNC`; a store knew it only while a log held that write, so after a flush (or when started from a snapshot,
 which is all tables) it sent nothing and nothing was checked. The manifest is written at every flush, so it can carry
 it: format version 2, and a version-1 manifest still reads, with the checksum unknown (`ManifestTest`).
+
+## The release (day 5)
+
+**What does v1.0.0 promise about its files?**
+It writes table format 1 and manifest format 2, and reads manifest format 1 (day 2's) as well; `keystore version`
+prints them (`About`). A table's format is in its footer: the magic's last byte, and a version field the footer's
+checksum covers. The manifest's is its magic's last byte. A store that a later version wrote, with a manifest or a
+table in a format this one doesn't know, is refused by name: "manifest format 3, which this build doesn't read (it
+reads 1 to 2): written by a later version of keystore, or damaged" (`Manifest.decode`, `TableFormat.decodeFooter`).
+
+**Why does it matter when the refusal comes, and not only that it comes?**
+Because opening a store changes it: recovery truncates a torn tail, and then every file the manifest doesn't account
+for is deleted as garbage. A build that read a later manifest as its own could delete the later version's files. So
+the format is the first thing checked in the manifest's bytes and each table's footer, before recovery touches
+anything, and `LaterFormatTest` compares every file's bytes before and after the refused open.
+
+**How would you change the log's record format?**
+A record has no version field and a log has no header, so nothing in a log's bytes says which format wrote it. A
+new format would get a new file name (`000004.wal`, say): recovery knows each file's format from its name and
+replays old logs with the old decoder until a flush covers them. Replication ships the leader's records exactly as
+its log holds them, so followers have to read both formats before any leader writes the new one: upgrade followers
+first. (Adding a version byte to each record now would itself be such a change.)
+
+**What does the release check do, and why run the tests again on a clean export?**
+`scripts/release_check.sh`: `mvn -B verify`; the same on a `git archive` of the commit in a temporary directory; the
+packaged jar's commands (`scripts/smoke.sh`) and the replication demo; then every measurement in the README again
+(five runs of `scripts/bench.sh`, summarised by `Medians`, and JMH with day 4's settings) and the kill tests. The
+clean export catches what exists only in my working tree: the build filters `src/main/resources`, and the tests read
+`README.md` and `pom.xml`, so a file I never added would pass locally and fail for whoever clones it.
+
+**How do you know the README's examples are right?**
+`ReadmeTest` runs "Run it"'s commands as written (put, flush, get, delete and dump; verify and snapshot; version)
+and compares what they print with what the README shows. I checked it fails the other way too: in a copy of the
+README, a wrong byte count in the snapshot line, a wrong sequence range in verify's report, a wrong oldest manifest
+format and a wrong value read from the snapshot each failed a test.
+
+**Why Java, for a storage engine?**
+The JDK has what this needs: `FileChannel.force` (which issues `F_FULLFSYNC` on macOS; checked in the JDK's own
+code), positional reads, CRC32C, `VarHandle` for the skip list's memory ordering, and virtual threads for a thread a
+connection. The costs are real: the memtable lives on the heap (64 bytes of structure a key, measured), so garbage
+collection pauses are possible; there's no control over the page cache; and an interrupted `FileChannel` closes for
+every thread (the store reopens a table's channel, and never interrupts its own threads). Java storage systems in
+production keep their bulk data off the heap (Cassandra's off-heap memtables and Bloom filters, HBase's off-heap
+block cache) or leave it to the page cache (Kafka's log); this one keeps the memtable on the heap.
+
+**What would you do differently if you started again?**
+Group commit and flushes off the writer's thread from the start. They change the write path's shape (a log thread,
+a queue, acknowledgements after a shared force), and adding them now means rewriting the part of the store with the
+most tests around it. And a version byte in the log record, for the reason above.
+
+**How would this become a distributed database?**
+It has one leader, asynchronous followers and no failover. The next step is a consensus log (Raft) in place of plain
+log shipping: a write is acknowledged once a majority has it, and a follower can be elected leader. `SYNC`'s
+checksum check is already Raft's previous-entry check, with the record's checksum standing in for the term. After
+that, the key space split into ranges, each its own replicated store, with something that places ranges on machines
+and splits them as they grow: the shape of TiKV (a Raft group per range, RocksDB on each node) and CockroachDB
+(the same idea over Pebble, an LSM tree written in Go).
 
 ## What's next
 

@@ -562,7 +562,8 @@ reads 1 to 2): written by a later version of keystore, or damaged" (`Manifest.de
 Because opening a store changes it: recovery truncates a torn tail, and then every file the manifest doesn't account
 for is deleted as garbage. A build that read a later manifest as its own could delete the later version's files. So
 the format is the first thing checked in the manifest's bytes and each table's footer, before recovery touches
-anything, and `LaterFormatTest` compares every file's bytes before and after the refused open.
+anything (by then the open has only opened, or created, the lock file), and `LaterFormatTest` compares every other
+file's bytes before and after the refused open.
 
 **How would you change the log's record format?**
 A record has no version field and a log has no header, so nothing in a log's bytes says which format wrote it. A

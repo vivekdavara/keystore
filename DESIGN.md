@@ -818,7 +818,8 @@ damaged` (or `table format 2, ...`). Both were refused before day 5 too, but as 
 manifest magic" and "format version 2, not 1". The format is checked before anything else in the file is read, since
 a later format may lay the rest out differently; "or damaged" because a flipped bit in that byte looks the same.
 What matters more than the message is when the refusal comes: before recovery truncates a log, writes a manifest or
-deletes anything (`LaterFormatTest` compares the bytes of every file but the lock before and after). An open that went on would delete,
+deletes anything; by then the open has only opened (or created) the lock file. `LaterFormatTest` compares the bytes of
+every other file before and after. An open that went on would delete,
 as garbage, any file the later version's manifest names and this one's doesn't.
 
 **What a later format change has to do**, to keep that true:

@@ -253,7 +253,7 @@ CI runs it on Linux and macOS.
 | A damaged block fails its read and nothing else; a merge that reaches it stops writes and keeps the manifest; the server's reply says what's wrong; `verify` finds it before any read does | `TableDamageTest`, `MainTest` |
 | The manifest keeps the last write's checksum through flushes and merges; a follower restarted with every write in a table still gets `DIVERGED` from a leader with a different history | `ReplicateTest`, `ReplicationTest`, `ManifestTest` |
 | **Day 5** | |
-| A manifest or table in a later version's format is refused by name, and the refused open changes no file | `LaterFormatTest`, `ManifestTest`, `TableTest` |
+| A manifest or table in a later version's format is refused by name, and the refused open leaves every file as it was (it only opens, or creates, the lock file) | `LaterFormatTest`, `ManifestTest`, `TableTest` |
 | `keystore version` names the pom's version, and its format numbers are the ones in the files a store writes | `MainTest` |
 | Every "Run it" example prints what the README shows (put to dump, verify, snapshot, version) | `ReadmeTest` |
 | The medians the release check reports | `MediansTest` |

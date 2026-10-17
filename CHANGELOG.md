@@ -52,9 +52,9 @@ and the benchmarks JMH. The design is in [DESIGN.md](DESIGN.md), the measured re
 
 ### Failure and measurement (day 4)
 
-- Kill tests: a child JVM writing to a store, the real `keystore follow`, and the real `keystore serve` are killed
-  with SIGKILL again and again (at random moments, and at a chosen write or force of any file); after each death
-  the store holds exactly a prefix of its writes, with every acknowledged write in it.
+- Kill tests: a child JVM writing to a store is killed with SIGKILL at random moments and at a chosen write or force
+  of any file, and the real `keystore follow` and `keystore serve` at random moments, again and again; after each
+  death the store holds exactly a prefix of its writes, with every acknowledged write in it.
 - Snapshots (`Store.snapshot`, `keystore snapshot DIR TARGET`): hard links to the immutable tables and a manifest,
   built beside the target and renamed into place. A `BEHIND` follower can start again from one.
 - The manifest (format 2) keeps the last write's checksum, so a store whose writes are all in tables can still show
@@ -67,7 +67,7 @@ and the benchmarks JMH. The design is in [DESIGN.md](DESIGN.md), the measured re
 
 - `keystore version`: the build's version and the file formats it writes and reads.
 - A manifest or table in a format this build doesn't know (a later version's) is refused by name, before the open
-  changes any file: `manifest format 3, which this build doesn't read (it reads 1 to 2): written by a later version
+  changes any file (it opens, or creates, only the lock file): `manifest format 3, which this build doesn't read (it reads 1 to 2): written by a later version
   of keystore, or damaged`. It was refused before too, but as a missing magic or "format version 2, not 1".
 - `scripts/release_check.sh`: the tests, the tests again on a clean `git archive` of the commit, the packaged command
   and the replication demo, every measurement in the README again, and the kill tests; `quick` for the first four.

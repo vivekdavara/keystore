@@ -110,10 +110,14 @@ anything; after those four commands it prints:
 ```
 target/demo/MANIFEST: tables cover writes up to #1; logs start at 000002.log; next file number 4
   000003.sst: 152 bytes, writes #1 to #1
+  000001.log: 35 bytes, covered by the tables, kept for followers (or garbage the next open deletes)
 target/demo/000002.log: 25 bytes
          0  #2 delete city
 clean: 25 bytes, every one a good record
 ```
+
+The flushed log, `000001.log`, stays: every command keeps up to 64 MiB of covered log, as `serve` does for its
+followers, because the directory may be a stopped leader's.
 
 For a log the store would refuse to open, it shows where the damage is and lists the intact records after it, the
 ones `RecoveryMode.POINT_IN_TIME` would drop, and exits with status 3.

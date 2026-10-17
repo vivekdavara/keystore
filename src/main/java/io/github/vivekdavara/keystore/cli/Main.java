@@ -69,6 +69,15 @@ public final class Main {
     /** The flushed log a leader started by {@code serve} keeps for its followers. */
     static final long SERVE_RETAIN_LOG_BYTES = 64L << 20;
 
+    /**
+     * What {@code serve} and the one-shot commands (put, get, delete, flush, compact, snapshot) open
+     * a store with. A one-shot command's directory may be a stopped leader's, and an open deletes the
+     * covered logs its options don't keep: with the defaults, which keep none, even {@code get}
+     * deleted the log {@code serve} had kept, and a follower a few writes behind then found its
+     * leader {@code BEHIND} (the release review found it through {@code snapshot}).
+     */
+    static final Options LEADER_OPTIONS = Options.defaults().withRetainLogBytes(SERVE_RETAIN_LOG_BYTES);
+
     public static void main(String[] args) {
         String command = args.length > 0 ? args[0] : "";
         if (command.equals("serve") || command.equals("follow")) {
@@ -130,7 +139,7 @@ public final class Main {
         Path dir = Path.of(args[1]);
         int port = args[2].equals("0") ? 0 : port(args[2]); // 0: any free port (the line printed says which)
         InetSocketAddress leader = follow ? address(args[3]) : null;
-        Options options = follow ? Options.defaults() : Options.defaults().withRetainLogBytes(SERVE_RETAIN_LOG_BYTES);
+        Options options = follow ? Options.defaults() : LEADER_OPTIONS;
         Store store = Store.open(dir, options);
         Follower follower = null;
         Server server = null;
@@ -280,7 +289,7 @@ public final class Main {
             if (command.equals("verify")) {
                 return StoreCheck.verify(dir, out) > 0 ? 3 : 0;
             }
-            try (Store store = Store.open(dir)) {
+            try (Store store = Store.open(dir, LEADER_OPTIONS)) {
                 switch (command) {
                     case "put" -> store.put(Bytes.utf8(args[2]), Bytes.utf8(args[3]));
                     case "delete" -> store.delete(Bytes.utf8(args[2]));

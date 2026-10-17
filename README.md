@@ -118,6 +118,21 @@ clean: 25 bytes, every one a good record
 For a log the store would refuse to open, it shows where the damage is and lists the intact records after it, the
 ones `RecoveryMode.POINT_IN_TIME` would drop, and exits with status 3.
 
+**Which build.** `version` names the build and the file formats it writes:
+
+```bash
+scripts/keystore version
+```
+
+prints
+
+```
+keystore 1.0.0 (Java 21.0.12.1)
+table format 1; manifest format 2, reads 1 to 2
+```
+
+A table's footer and the manifest's magic carry those numbers, so a later build can tell its files from these.
+
 **Check and copy a store.** `verify` reads every block of every table and every log record, and exits 3 if
 anything is damaged (a store itself reads a table's block only when a read or a merge reaches it). After
 `put target/demo city Boston`, `flush target/demo` and `put target/demo river Charles`:

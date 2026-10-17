@@ -457,10 +457,8 @@ class TableTest {
     }
 
     /**
-     * Found by review, with a crafted file whose checksums are all valid: the index's block count was
-     * bounded only by the footer's entry count, so the reader allocated three arrays of that many
-     * elements before finding the index far too short for them, and died of an OutOfMemoryError.
-     * The count is now checked against the index's length first.
+     * A table a later build wrote, by its footer's version field (its checksum recomputed) or by its
+     * magic: refused at open, naming the format.
      */
     @Test
     void aTableInALaterFormatIsRefusedByName() throws IOException {
@@ -523,6 +521,12 @@ class TableTest {
         }
     }
 
+    /**
+     * Found by review, with a crafted file whose checksums are all valid: the index's block count was
+     * bounded only by the footer's entry count, so the reader allocated three arrays of that many
+     * elements before finding the index far too short for them, and died of an OutOfMemoryError.
+     * The count is now checked against the index's length first.
+     */
     @Test
     void anIndexClaimingAHugeBlockCountIsRefusedBeforeAllocating() throws IOException {
         TreeMap<byte[], Entry> entries = new TreeMap<>(Bytes.ORDER);

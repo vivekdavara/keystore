@@ -463,7 +463,7 @@ What the numbers say:
   `F_FULLFSYNC` (2,994 µs), and a plain `fsync` would be about a hundred times cheaper (26 µs) but doesn't flush the
   drive's cache. That `FileChannel.force` issues `F_FULLFSYNC` on macOS is checked in the JDK's own code
   (DESIGN.md, "Appending"). `NEVER` is about 1,450 times faster because it never waits for the device. Group commit,
-  sharing one flush among concurrent writers, is the usual way between the two (day 4).
+  sharing one flush among concurrent writers, is the usual way between the two; it isn't built (see "Limitations").
 - **Recovery reads at about 500 MB/s**, so replaying a 64 MB log (a plausible memtable) takes about a tenth of a
   second. The range across the 5 runs was 257 to 517 ms.
 - **The scan that tells a torn tail from damage costs about a millisecond per megabyte** over zeros or random bytes:
@@ -714,7 +714,11 @@ wasn't used up when it caught up in fewer, and fired at the cycle's close; the c
 - No authentication or TLS; the server listens on the loopback address.
 - A log record has no format version and the protocol no handshake: a change to either needs a new file name or a
   new command (DESIGN.md, "The release"). `keystore verify` reports a file in a later format as damaged (exit 3),
-  with the message saying which format it is.
+  with the message saying which format it is; `dump` reads the manifest and the logs, not the tables, so it doesn't
+  notice a later version's table.
+- Every `keystore` command but `dump`, `verify` and `client` opens the store as a writer would: it takes the lock
+  (so not while a server has the directory), runs recovery (truncating a torn tail) and deletes what the manifest
+  doesn't account for, keeping 64 MiB of covered log as `serve` does.
 
 DESIGN.md's "Limitations" has the full list.
 

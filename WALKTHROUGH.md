@@ -52,7 +52,8 @@ lock-free readers. LevelDB, RocksDB and HBase use skip lists.
 
 **How can readers skip the lock while a writer inserts?** (`SkipList.put`)
 The writer fills in the new node completely (key, entry, its own next pointers), then links it in from level 0 up,
-each link a volatile write (`AtomicReferenceArray.set`). A reader follows links with volatile reads. A volatile write
+each link a volatile write (`VarHandle.setVolatile` on the node's array of next pointers). A reader follows links
+with volatile reads. A volatile write
 happens-before every read that sees it, so a reader that reaches the node through any link sees everything written
 before that link. Nodes are never removed, so there's no use-after-free equivalent.
 
@@ -89,9 +90,10 @@ But p = 1/4 needs 1.33 pointers per node instead of 2. Twelve levels serve about
 expected cost. Same as LevelDB.
 
 **Why overwrite the entry in place instead of keeping versions?**
-There are no snapshots yet, so old versions would only cost memory. The swap is one volatile write of an immutable
-`Entry`, so a reader sees the old entry or the new one. If day 4's snapshots need versions, the key becomes
-(user key, sequence number), as in LevelDB.
+Nothing reads an older version of a key: a read wants the newest, and day 4's snapshots flush the memtable first
+and then share tables, so old versions would only cost memory. The swap is one volatile write of an immutable
+`Entry`, so a reader sees the old entry or the new one. Reads as of a past sequence number (LevelDB's snapshots)
+would need versions: the key would become (user key, sequence number), as in LevelDB.
 
 **What's the catch with in-place overwrites?**
 A million overwrites of one key leave a tiny memtable and a huge log, so day 2's flush must be triggered by the
@@ -269,7 +271,7 @@ injects a fault at a random write or force anywhere (249 crashes) and checks eve
 moving the log deletion before the manifest fails it at the fourth cycle.
 
 **Why rewrite the manifest whole instead of appending to it?**
-It is tiny (40 bytes plus 32 per table) and changes only on a flush or a merge, so writing a temp file, forcing it
+It is tiny (48 bytes plus 32 per table; 40 in day 2's format 1) and changes only on a flush or a merge, so writing a temp file, forcing it
 and renaming it over the old one is cheap, and the rename is atomic: a crash leaves the old manifest or the new one.
 LevelDB appends edits to a manifest log, which scales to thousands of files but needs its own recovery rules.
 
@@ -318,8 +320,9 @@ interrupted `get` closed a table's channel for every reader.
 
 **What happens to writes while a flush or merge runs?**
 They wait: both run in the writing thread under the write lock. Reads don't wait. The slowest of a million writes in
-`bench fill` waited 254 ms (median of 5 runs) for a flush and a merge. LevelDB and RocksDB do this work on background threads and only slow writers
-down when it falls behind; that's day 4's, with group commit.
+`bench fill` waited 254 ms (median of 5 runs) for a flush and a merge. LevelDB and RocksDB do this work on background
+threads and only slow writers down when it falls behind. That isn't built here, nor is group commit ("What's
+next").
 
 ## The server and replication (day 3)
 
@@ -379,8 +382,8 @@ the record is acknowledged. If the store deleted the log mid-read, the tail's op
 Flushed logs are deleted unless `Options.retainLogBytes` keeps them (the newest ones, oldest deleted first, so
 what's left is unbroken; `keystore serve` keeps 64 MiB, like Postgres's `wal_keep_size`). If the record the follower
 needs is gone, the tail throws `BehindException`, the leader sends `ERR BEHIND oldest`, and the follower stops in
-state `BEHIND`: it needs a copy of the leader's tables, which day 4's snapshots will provide
-(`ReplicationTest.aFollowerWhoseNextRecordIsGoneStopsAsBehind`).
+state `BEHIND` (`ReplicationTest.aFollowerWhoseNextRecordIsGoneStopsAsBehind`): it needs a copy of the leader's
+tables, which a snapshot is (day 4: `SnapshotTest.aFollowerThatIsBehindStartsAgainFromASnapshot`).
 
 **Where does a follower keep its position, and what if it crashes?**
 Its position is its own store's `lastSequence()`. Nothing else is stored. After a crash the store recovers like any

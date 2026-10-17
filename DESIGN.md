@@ -155,7 +155,8 @@ never lock. This is safe because of the order in which the writer publishes a ne
 
 1. It fills in the node: key, entry, and the node's own next pointers at every level.
 2. It links the node in from the bottom up: level 0 first, then level 1, and so on. Each link is a volatile write
-   (the next pointers are an `AtomicReferenceArray`).
+   (the next pointers are a plain array, written with `VarHandle.setVolatile`; an `AtomicReferenceArray` until
+   `3707eca`).
 
 A reader follows next pointers with volatile reads. Under the Java memory model, a volatile write happens-before every
 volatile read that sees it, so a reader that reaches the new node through any link also sees everything the writer

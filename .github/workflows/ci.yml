@@ -9,7 +9,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Pinned, so a release's run is on the images every earlier run used (ubuntu-latest moves to 26.04 from
+        # Oct 19, 2026). macos-26 is what macos-latest has been.
+        os: [ubuntu-24.04, macos-26]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
 
@@ -23,15 +25,7 @@ jobs:
       - name: Test
         run: mvn -B verify
       - name: Run the packaged command
-        run: |
-          scripts/keystore put target/ci-store city Boston
-          scripts/keystore flush target/ci-store
-          test "$(scripts/keystore get target/ci-store city)" = Boston
-          scripts/keystore delete target/ci-store city
-          scripts/keystore flush target/ci-store
-          scripts/keystore compact target/ci-store
-          if scripts/keystore get target/ci-store city; then exit 1; fi
-          scripts/keystore dump target/ci-store
+        run: scripts/smoke.sh
       - name: Replicate between two packaged servers
         run: scripts/replication-demo.sh
       - name: JMH benchmarks, one short iteration each (a smoke run, not a measurement)

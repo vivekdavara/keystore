@@ -773,7 +773,8 @@ snapshot's links keep a table's space allocated after the store deletes it, for 
 checksum coming from the manifest; the leader checks it against its own write N if its logs still hold it, and
 streams from N+1 if they hold that (`SnapshotTest.aFollowerThatIsBehindStartsAgainFromASnapshot`). There is no
 `SNAPSHOT` command in the protocol yet, so the snapshot is made by the leader's own process: `Store.snapshot` in it,
-or `keystore snapshot` on its directory while it is stopped.
+or `keystore snapshot` on its directory while it is stopped (which, since day 5, keeps the logs the leader kept for
+its other followers: "The release", below).
 
 ## Damage found while running (day 4)
 
@@ -838,6 +839,16 @@ as garbage, any file the later version's manifest names and this one's doesn't.
 - **The protocol:** an unknown command gets `ERR PROTOCOL unknown command "FROB"` and the connection is closed, so a
   new command is safe to add and a client can tell it is talking to an older server. `SYNC` has no version of its own,
   which is one more reason for the log rule above.
+
+### One-shot commands and a stopped leader's logs
+
+Opening a store deletes the covered logs its options don't keep (`Options.retainLogBytes`), and the retention lives
+in the options, not in the store. Until day 5's review, the one-shot commands (`put`, `get`, `delete`, `flush`,
+`compact`, `snapshot`) opened with the defaults, which keep none: run on a stopped leader's directory, even a `get`
+deleted the 64 MiB of log `serve` had kept for its followers, and a follower a few writes behind found its leader
+`BEHIND` when it came back. A command can't tell a leader's directory from any other, so they all now open with
+`serve`'s options (`Main.LEADER_OPTIONS`); a store that never served keeps up to 64 MiB of covered log because of it.
+Recording the retention in the manifest, so that every open applies the store's own rule, would be the sturdier fix.
 
 ### The release check
 
@@ -1055,8 +1066,17 @@ Day 1's tests are first; day 2's (tables, the flush, the manifest, versions, com
 - **The README's examples** (`ReadmeTest`): `verify`, `snapshot` and `version` print what "Run it" shows, as the first
   five commands did. In a copy of the README, a wrong byte count in the snapshot line, a wrong sequence range in
   verify's report, a wrong oldest manifest format and a wrong value read from the snapshot each fail a test.
-- **`Medians`** (`MediansTest`): medians and ranges per benchmark, in order; labels such as "p99.9" aren't numbers;
-  an even number of runs; runs whose words differ are refused.
+- **`Medians`** (`MediansTest`): medians and ranges per benchmark, in order; labels such as "p99.9" aren't numbers,
+  nor is a number glued to a word; an even number of runs; runs whose words differ are refused.
+- **The release review's tests** (`review5/`): one-shot commands on a stopped leader keep its followers' logs (the
+  real command in a child JVM, then a tail from #50); format 0 is called damage, not a later version's; every JMH run
+  fails on a benchmark that throws (`-foe true`).
+- **What the review could change unnoticed, now tested**: the manifest's format check before its checksum, a table's
+  magic before its footer, the magic's "KSTABLE" prefix (`ManifestTest`, `TableTest`), and the order of recovery: a
+  refused open on a store with a torn tail, an orphan table and a covered log changes none of them, where a control
+  copy that opens changes all three (`LaterFormatTest`). Checked by mutation here: the format check moved after the
+  checksum, and orphans deleted before the tables are checked, each fail their test. The lock file a refused open may
+  create is the only addition (`LaterFormatTest`).
 
 ## Plan for days 3–5
 

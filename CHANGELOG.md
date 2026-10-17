@@ -68,7 +68,13 @@ and the benchmarks JMH. The design is in [DESIGN.md](DESIGN.md), the measured re
 - `keystore version`: the build's version and the file formats it writes and reads.
 - A manifest or table in a format this build doesn't know (a later version's) is refused by name, before the open
   changes any file (it opens, or creates, only the lock file): `manifest format 3, which this build doesn't read (it reads 1 to 2): written by a later version
-  of keystore, or damaged`. It was refused before too, but as a missing magic or "format version 2, not 1".
+  of keystore, or damaged`. It was refused before too, but as a missing magic or "format version 2, not 1". A format
+  no version wrote (0) is called damage.
+- The one-shot commands (`put`, `get`, `delete`, `flush`, `compact`, `snapshot`) open the store with `serve`'s
+  options, so on a stopped leader's directory they keep the 64 MiB of log `serve` kept for its followers. Before, even
+  `get` deleted it, and a follower a few writes behind then got `BEHIND` (found by the release review).
+- `scripts/jmh.sh` always passes `-foe true`: a benchmark that throws now fails the run, in CI's smoke run and in the
+  release check (JMH exits 0 otherwise; found by the release review).
 - `scripts/release_check.sh`: the tests, the tests again on a clean `git archive` of the commit, the packaged command
   and the replication demo, every measurement in the README again, and the kill tests; `quick` for the first four.
   `Medians` prints the medians and ranges of `scripts/bench.sh`'s runs.

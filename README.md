@@ -12,8 +12,8 @@ with a virtual thread a connection, and followers that apply the leader's log re
 numbers, read by the leader from its own log files, and catch up from their own position after any break); day 4
 failure and measurement (a writer, a follower and a leader killed with SIGKILL again and again, every acknowledged
 write checked; snapshots made of hard links to the tables; `keystore verify`; JMH); day 5 the release (`keystore
-version`, refusing files from later versions before changing anything, and a release check that runs every test and
-measurement again at the release's commit). The store depends on nothing; the tests use JUnit, and the benchmarks
+version`, refusing files from later versions before changing anything, and a release check that ran every test and
+measurement again at the release's code). The store depends on nothing; the tests use JUnit, and the benchmarks
 JMH. [DESIGN.md](DESIGN.md) has the design, and [WALKTHROUGH.md](WALKTHROUGH.md) the questions an interviewer is
 likely to ask, answered from the code.
 
@@ -22,6 +22,27 @@ likely to ask, answered from the code.
 Storage engines are mostly about what happens when things go wrong: a crash in the middle of a write, a flush that
 fails, a bit that flips on disk. This project tries to be exact about those cases, with tests that create each one,
 rather than only getting the happy path fast. Every claim below has a test or a command next to it.
+
+## Results at a glance
+
+v1.0.0, as the release check measured it at `3c06d44` (Apple M3, macOS 26.6.2, OpenJDK 21.0.12, on battery, with
+a video playing; 16-byte keys and 100-byte values, synthetic). Medians of 5 runs unless it says JMH; "Results" has
+every figure with its range, its conditions and each day's own.
+
+| What | v1.0.0 | Command |
+|---|---|---|
+| A durable `put` (`EVERY_WRITE`: one `F_FULLFSYNC` each) | 350 a second, p50 2,997 µs | `Bench writes EVERY_WRITE 1000 100` |
+| A `put` under `NEVER` | 340,947 a second, p50 1.7 µs | `Bench writes NEVER 200000 100` |
+| 1,000,000 random puts, with 33 flushes and 10 merges | 266,071 a second; the slowest 255 ms; 3.37 bytes of table written a byte | `Bench fill 1000000 100` |
+| A `get` in 4 tables with 10-bit Bloom filters: present, absent | p50 2.0 µs, 0.1 µs | `Bench reads 1000000 100 10` |
+| Absent-key gets across 14 tables: 1-bit filters, 10-bit | 69,795 and 1,822,259 a second (JMH) | `scripts/jmh.sh` (`ReadBenchmark`) |
+| Opening a store whose log holds 1,000,000 puts (141 MB) | 267 ms | `Bench recover 1000000 100` |
+| Over loopback TCP, one connection: puts, gets | 35,575 and 38,982 a second (p50 26.6 µs, 25.6 µs) | `Bench server 1 100000 100` |
+| One connection with 128 requests in flight: puts, gets | 192,145 and 294,001 a second | `Bench pipeline 128 200000 100` |
+| A new follower catching up on 1,000,000 writes | 221,839 records a second | `Bench catchup 1000000 100 NEVER` |
+| One write's replication lag, the follower under `NEVER` | p50 27.9 µs | `Bench lag 10000 100 NEVER` |
+| A snapshot of a 27 MB store, hard-linked | 16.9 ms (JMH) | `scripts/jmh.sh` (`SnapshotBenchmark`) |
+| SIGKILLs of a writing process, a follower and a leader | 142 deaths; no acknowledged write lost | the kill tests |
 
 ## Architecture
 
@@ -267,9 +288,91 @@ test had to fail, and the file was restored. DESIGN.md, "Testing", lists which.
 
 ## Results
 
-Day 4's numbers are JMH's. Days 1 to 3's are plain wall-clock timings: `scripts/bench.sh` prints one line per run,
-each run after a warm-up run in the same JVM, and each figure is the median of 5 runs. `Bench` is
+The release check measured everything again at v1.0.0's code ("At v1.0.0", first). The day sections after it are
+each day's own measurements, at that day's commit, with what they showed. Day 4's numbers are JMH's; the others are
+plain wall-clock timings: `scripts/bench.sh` prints one line per run, each run after a warm-up run in the same JVM,
+and each figure is the median of 5 runs. `Bench` is
 `java -cp target/classes:target/test-classes io.github.vivekdavara.keystore.bench.Bench`.
+
+### At v1.0.0: every measurement again
+
+`scripts/release_check.sh` at `3c06d44` (v1.0.0's code; the release commit after it changes only the version in
+`pom.xml` and the docs), 16:04 to 16:27: `scripts/bench.sh 5` from 16:09 to 16:22, then JMH and the kill tests.
+Apple M3, macOS 26.6.2, the internal SSD, OpenJDK 21.0.12, **on battery** (47% to 36%), Low Power Mode off,
+and **not a quiet machine**: VLC was playing a video (about a quarter of a core, plus the window server's and the
+audio daemon's), load average 3.3 at the start. Keys are 16 bytes and values 100; the data is synthetic. Each
+figure is the median of 5 runs, with the range in brackets; this is `bench-medians.txt` as `Medians` printed it:
+
+```
+none         1000 appends of 128 bytes, median of 5: p50 3.0 [3.0..4.0] us, p99 14.0 [11.0..42.0] us
+fsync        1000 appends of 128 bytes, median of 5: p50 27.0 [17.0..28.0] us, p99 80.0 [53.0..88.0] us
+F_FULLFSYNC  1000 appends of 128 bytes, median of 5: p50 2994.0 [2993.0..2998.0] us, p99 4003.0 [3983.0..4026.0] us
+server connections=1 count=100000 value=100B, median of 5: puts 35575 [35321..35663]/s, p50 26.6 [26.5..26.8] us, p99 36.5 [35.4..36.8] us; gets 38982 [37830..39824]/s, p50 25.6 [25.3..25.8] us, p99 34.0 [33.0..35.4] us
+server connections=4 count=100000 value=100B, median of 5: puts 70346 [68152..70801]/s, p50 49.3 [48.8..51.1] us, p99 102.0 [100.4..106.0] us; gets 89129 [88008..89646]/s, p50 42.0 [41.8..42.3] us, p99 86.8 [84.9..88.3] us
+server connections=16 count=100000 value=100B, median of 5: puts 70627 [69427..74542]/s, p50 227.8 [214.3..234.2] us, p99 384.3 [370.4..402.9] us; gets 109535 [82867..110395]/s, p50 139.1 [138.1..165.6] us, p99 273.9 [263.2..659.9] us
+catchup count=1000000 value=100B sync=NEVER, median of 5: 4508 [4498..5301] ms, 221839 [188650..222324] records/s, 31 [27..31] MB/s of log, 977 batches (1024 records a batch), follower flushes 33
+catchup count=1000000 value=100B sync=EVERY_WRITE, median of 5: 6183 [6119..6658] ms, 161728 [150194..163423] records/s, 23 [21..23] MB/s of log, 977 batches (1024 records a batch), follower flushes 33
+lag count=10000 value=100B sync=NEVER, median of 5: p50 27.9 [27.6..28.0] us, p99 72.5 [70.7..73.1] us, max 676.4 [617.8..1444.5] us
+lag count=1000 value=100B sync=EVERY_WRITE, median of 5: p50 2992.9 [2974.1..3018.3] us, p99 4637.4 [4539.3..5028.1] us, max 10110.0 [9976.9..11256.3] us
+pipeline depth=1 count=200000 value=100B, median of 5: puts 36201 [36182..36417]/s, gets 40717 [39958..40897]/s
+pipeline depth=16 count=200000 value=100B, median of 5: puts 158121 [155808..159166]/s, gets 216399 [214376..218692]/s
+pipeline depth=128 count=200000 value=100B, median of 5: puts 192145 [191371..192867]/s, gets 294001 [293896..296390]/s
+fill count=1000000 value=100B, median of 5: 266071 [262516..267991] writes/s, p50 1.9 us, p99 4.4 [4.4..4.5] us, p99.9 5.8 [5.6..7.2] us, max 255.0 [247.9..268.6] ms; 33 flushes, 10 merges, 3 tables; table bytes written per byte of keys and values 3.37 (flushes 1.15, merges 2.22); reopen 9 ms
+reads count=1000000 value=100B bits=1, median of 5: 4 tables; present: p50 4.5 us, p99 7.8 [7.7..7.9] us, 2.519 blocks a get; absent: p50 4.6 [4.6..4.7] us, p99 8.0 [7.8..8.3] us, 2.526 blocks a get
+reads count=1000000 value=100B bits=5, median of 5: 4 tables; present: p50 2.0 [1.9..2.0] us, p99 5.3 [5.3..5.4] us, 1.222 blocks a get; absent: p50 0.1 us, p99 4.0 us, 0.365 blocks a get
+reads count=1000000 value=100B bits=10, median of 5: 4 tables; present: p50 2.0 [1.9..2.0] us, p99 3.9 [3.8..5.4] us, 1.020 blocks a get; absent: p50 0.1 us, p99 2.4 us, 0.033 blocks a get
+reads count=1000000 value=100B bits=16, median of 5: 4 tables; present: p50 2.0 us, p99 3.2 [3.0..3.5] us, 1.001 blocks a get; absent: p50 0.1 us, p99 0.2 [0.2..0.3] us, 0.002 blocks a get
+writes sync=NEVER count=200000 value=100B, median of 5: 340947 [335040..343592] writes/s, p50 1.7 [1.6..1.7] us, p99 4.1 [4.0..4.1] us, max 81606.3 [80142.0..82962.1] us
+writes sync=EVERY_WRITE count=1000 value=100B, median of 5: 350 [345..352] writes/s, p50 2997.4 [2993.5..2998.1] us, p99 4055.2 [4046.7..6024.4] us, max 10140.0 [10056.6..15507.3] us
+recover count=1000000 value=100B log=141.0 MB, median of 5: 267 [259..299] ms, 3743156 [3348386..3867094] records/s, 528 [472..545] MB/s
+scan tail=67.1 MB of zeros, median of 5: 35 ms, 1907 [1893..1913] MB/s (TORN_TAIL)
+scan tail=67.1 MB of random, median of 5: 69 [68..72] ms, 979 [934..986] MB/s (TORN_TAIL)
+memory count=1000000 key=16B value=100B, median of 5: memtable structure 64.2 bytes/key, with the arrays 216.2; approximateBytes charges 212.0
+skiplist SkipList count=1000000, median of 5: 949161 [941009..968655] inserts/s, 706643 [699965..820066] lookups/s
+skiplist ConcurrentSkipListMap count=1000000, median of 5: 946599 [896170..1015333] inserts/s, 799520 [773745..1114059] lookups/s
+```
+
+Against each day's own measurement, at that day's commit (the tables below):
+
+| What | v1.0.0 | When first measured |
+|---|---|---|
+| `put` under `EVERY_WRITE` | 350 writes/s, p50 2,997 µs | 361/s, 2,990 µs (day 1) |
+| `put` under `NEVER`, 200,000 (flushes included) | 340,947 writes/s, p50 1.7 µs | 336,578/s, 1.7 µs (day 2, on battery) |
+| 1,000,000 random puts with flushes and merges | 266,071 writes/s; slowest 255 ms; 3.37 bytes of table a byte | 253,593/s; 254 ms; 3.37 (day 2) |
+| `get`, 10 bits a key: present, absent | p50 2.0 µs (1.020 blocks), 0.1 µs (0.033 blocks) | the same (day 2) |
+| Recovery of 1,000,000 puts (141.0 MB) | 267 ms, 528 MB/s | 284 ms (day 1), 250 ms (day 2) |
+| The scan after damage, 64 MiB of zeros, of random bytes | 35 ms, 69 ms | 60 ms, 75 ms (day 1) |
+| Skip list, 1,000,000 inserts and lookups | 949,161 and 706,643 a second (`ConcurrentSkipListMap` 946,599 and 799,520) | 877,000 and 781,000 (892,000 and 870,000) (day 1) |
+| Over TCP, 1 / 4 / 16 connections: puts | 35,575 / 70,346 / 70,627 a second | 35,096 / 68,199 / 68,795 (day 3) |
+| The same: gets | 38,982 / 89,129 / 109,535 a second | 38,633 / 86,232 / 107,105 (day 3) |
+| One connection, 16 and 128 requests in flight: puts, gets | 158,121 and 192,145; 216,399 and 294,001 | 147,534 and 175,815; 214,907 and 292,803 (day 3) |
+| A follower catching up on 1,000,000 writes, under `NEVER` / `EVERY_WRITE` | 221,839 / 161,728 records/s | 212,089 / 152,697 (day 3) |
+| One write's replication lag, follower under `NEVER` / `EVERY_WRITE` | p50 27.9 µs / 2,993 µs | 28.0 µs / 2,959 µs (day 3) |
+
+- **Little moved in five days of changes**, on a busier machine. Within 5% of its day's figure: the writes, the
+  fill, the reads, the server's puts and gets, and live replication. Faster by more: pipelined puts (7% at 16 in
+  flight, 9% at 128), a forcing follower's catch-up (6%), the skip list's inserts (8%), and the scans after damage
+  (35 against 60 ms over zeros, 69 against 75 over random bytes; day 3 changed the log's reader in two commits,
+  `5a0083a` and `b7a4c12`, and I haven't measured which change, if either, did it). Slower by more: recovery against
+  day 2's run (267 against 250 ms; day 1 measured 284), and the skip list's lookups (706,643 against 781,000 a
+  second, while `ConcurrentSkipListMap`'s fell from 870,000 to 799,520 in the same runs; both spread widely).
+- **The durable write is still one device flush**: 2,997 µs a put against the C program's `F_FULLFSYNC` 2,994 µs.
+- **The write path's worst case is still the merge in the writer's thread**: 255 ms for the slowest of a million.
+
+JMH, the same run (16:22 to 16:26; 2 forks, 3 warm-up and 5 measured iterations of 1 s; ± is JMH's 99.9% interval),
+against day 4's at `80958ce` and `0a59726`:
+
+| Benchmark | v1.0.0 | Day 4 |
+|---|---|---|
+| Get, absent key, 14 tables, 1 / 5 / 10 / 16 bits a key | 69,795 ± 758 / 390,327 ± 18,546 / 1,822,259 ± 47,901 / 3,228,798 ± 91,076 a second | 69,409 / 389,516 / 1,735,369 / 3,173,820 |
+| Get, present key, the same | 118,270 ± 7,589 / 341,258 ± 940 / 476,988 ± 3,363 / 492,808 ± 5,292 a second | 114,188 / 320,884 / 437,185 / 464,668 |
+| Blocks a lookup, absent / present | 8.840, 1.282, 0.114, 0.007 / 5.280, 1.621, 1.056, 1.003 | the same: the data and the filters are deterministic |
+| Puts under `NEVER` / `EVERY_WRITE` | 257,384 ± 126,101 / 330.5 ± 13.8 a second | 208,692 ± 109,797 / 339.5 ± 11.4 |
+| A snapshot of 27 MB in 4 tables, linked / copied | 16.869 ± 1.092 / 54.833 ± 37.849 ms | 15.061 ± 0.384 / 50.565 ± 46.709 ms (2 warm-ups, a busier machine) |
+
+The kill tests, the same run: 142 deaths by SIGKILL, and no acknowledged write lost. Random moments, 20 under each
+sync policy; chosen steps, 46 under `EVERY_WRITE` and 36 under `NEVER` at the same steps as day 4 (a seed fixes them);
+the follower 12 (7 of them more than 1,000 writes behind its leader); the leader 8 (the write in flight kept by 7).
 
 ### Day 4: JMH, reads and the Bloom filter
 
@@ -625,6 +728,59 @@ limit by the table's path, before it said what was wrong (`TableDamageTest`); it
 failed once on a day-3 test, `FollowerCrashCycleTest` (Ubuntu, run 38954660518): a fault armed for a follower's writes
 wasn't used up when it caught up in fewer, and fired at the cycle's close; the countdown is now disarmed before close.
 
+### Day 5 (the release)
+
+One agent reviewed the whole repo at `e310487` (the release's own code by then: `version`, the refusal of later
+formats, the release check), in its own git worktree, worded as a correctness and docs-against-code review, for
+about 19 minutes. It found four bugs, each with a test that failed; I reproduced each one before fixing it, and its
+tests are in `review5/`:
+
+- **A one-shot command deleted the logs a stopped leader kept for its followers.** `get`, `put`, `delete`, `flush`,
+  `compact` and `snapshot` opened the store with the default options, which keep no covered log, and an open deletes
+  the covered logs its options don't keep. So even `keystore get` on a stopped leader's directory deleted the log
+  `serve` had kept (up to 64 MiB), and a follower a few writes behind then got `BEHIND` when the leader came back.
+  This README suggested `keystore snapshot` on a stopped leader for a follower that was `BEHIND`: it would have made
+  the other followers `BEHIND` too. The one-shot commands now open with `serve`'s options.
+- **A benchmark that threw couldn't fail CI or the release check.** JMH reports an iteration that throws as
+  `<failure>` and exits 0 unless it is given `-foe true` (reproduced with a benchmark that throws: exit 0, and 1 with
+  the flag). `scripts/jmh.sh` now always passes it.
+- **Format 0 was called a later version's.** "Written by a later version of keystore, or damaged" for a manifest or
+  table of format 0, which no version wrote; it now says the file is damaged.
+- **A refused open creates the lock file** in a directory that has none (a snapshot, a copy), where the docs said a
+  refused open changes nothing. I kept the behaviour and fixed the docs: the lock is taken before anything is read,
+  and deleting a lock file would let two processes lock two different files. A test pins that the lock file is the
+  only addition.
+
+It also found seven stale or wrong claims in the README, DESIGN.md and WALKTHROUGH.md (the skip list's
+`AtomicReferenceArray`, replaced on day 1; "no snapshots yet"; group commit promised for day 4; the manifest's size in
+its first format), two wrong comments in the release check, and five mechanisms it could change without any test
+failing: the order of the format checks and the checksums (manifest and table), the
+table magic's prefix check, and the order of recovery's table check and its deletions. Each now has a test; two of
+those I re-checked by making the change myself. From its judgement calls: `bench.sh` ran one benchmark twice, so its
+"median of 5" would have been of 10 runs; a `head` could have failed the release check under `pipefail`; the build's
+version was recorded from whatever jar was there before the build; and the smoke test took any error for "not
+found". All four are fixed.
+
+## Release check
+
+`scripts/release_check.sh` runs what CI runs, the same again on a clean `git archive` of the commit, the packaged
+command (`scripts/smoke.sh`) and the replication demo, then every measurement in this README and the kill tests
+(DESIGN.md, "The release", has each step and why). It ran twice:
+
+- **`quick`**, at `e056904` with the script itself not yet committed, 15:15 to 15:21: both test runs green (321 tests
+  in the export), the smoke run and the demo ok.
+- **In full**, at `3c06d44`, 16:04 to 16:27: every step passed, and the numbers in "Results at a glance" and
+  "Results", "At v1.0.0", are its own. Its code is v1.0.0's: the release commit after it sets the version in
+  `pom.xml` and changes only docs. (The docs were being edited during the run, so its end record says `-dirty`; no
+  source file or script was.)
+
+And by hand: the leader-and-follower commands in "Run it", on ports 8104 and 8105 (`put`, `get`, the follower's
+`info`, a write to the follower), each printed what this README shows.
+
+The release check passed the first time it ran in full. What day 5 found was found before it: reading the code for
+the release (a later version's manifest refused as "doesn't start with the manifest magic"; no test of a table's
+format number), and the review (above), whose `bench.sh` finding meant this run's medians are of 5 runs, not 10.
+
 ## Design decisions
 
 - **A hand-written skip list, one writer, lock-free readers.** Writes are serialised anyway (one log), so the skip
@@ -680,6 +836,9 @@ wasn't used up when it caught up in fewer, and fired at the cycle's close; the c
 - **`verify` is a separate full read**, not something `open` does: opening checks what it must to serve reads
   safely (footers, filters, indexes), and a read checks its block; reading every block on every open would make
   opening a large store as slow as reading it.
+- **Measure again at the release.** The release check re-ran every benchmark in this README at the release's code,
+  with the machine's conditions recorded, instead of carrying day 1's to day 4's numbers forward: every day changed
+  the code under them. (They moved little: "At v1.0.0".)
 - **A file from a later version is refused before the open changes anything.** Opening a store truncates a torn
   tail and deletes every file the manifest doesn't name, so a build that read a later manifest as its own could
   delete the later version's files. Each table's and the manifest's format is checked first, and the refusal names

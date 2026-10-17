@@ -588,6 +588,42 @@ and compares what they print with what the README shows. I checked it fails the 
 README, a wrong byte count in the snapshot line, a wrong sequence range in verify's report, a wrong oldest manifest
 format and a wrong value read from the snapshot each failed a test.
 
+**What did the release check find?**
+Nothing failed when it ran in full: both test runs, the packaged command, the replication demo, every benchmark and
+the kill tests passed at `3c06d44`, and the numbers moved little from each day's own (README, "At v1.0.0"). What the
+release work found came before it: reading the code for the release showed a later version's manifest refused as
+"doesn't start with the manifest magic", and the review found four bugs, one in the release check itself (a JMH run
+couldn't fail) and one in the benchmarks script (a benchmark ran twice, so its "median of 5" would have been of 10).
+The check is for the next one: it runs the tests on a clean export and measures everything again, so a stale number
+or a file I forgot to add can't reach a release unnoticed.
+
+**What are the read, write and space amplification?**
+Measured at v1.0.0. Write: a million random puts with the default flush and merges wrote 3.37 bytes of table per byte
+of keys and values (1.15 by flushes, 2.22 by merges), on top of each byte's one write to the log (`Bench fill`). Read,
+in blocks a lookup: a present key reads 1.020 blocks among 4 tables with 10-bit filters (1.056 among 14, JMH), an
+absent key 0.033 (0.114 among 14); with 1-bit filters an absent key reads 2.5 blocks among 4 tables and 8.8 among 14
+(`Bench reads`, `ReadBenchmark`). Space isn't measured: by construction a merge needs room for its output beside its
+inputs, up to the largest tier's size again, and overwritten values and tombstones take space until a merge reaches
+them.
+
+**Tell me about a bug the release review found.** (`review5/CommandOnAStoppedLeaderKeepsFollowersLogsTest`)
+`keystore get`, `put`, `delete`, `flush`, `compact` and `snapshot` opened the store with the default options, which
+keep no log once tables cover it, and opening a store deletes the covered logs its options don't keep. On a stopped
+leader's directory, even a `get` deleted the log `serve` had kept for its followers (up to 64 MiB), so a follower a
+few writes behind got `BEHIND` when the leader came back. Worse, the README told you to run `keystore snapshot` on a
+stopped leader to rescue a follower that was `BEHIND`: that would have made the other followers `BEHIND` too. The
+fix: every one-shot command opens with `serve`'s options (`Main.LEADER_OPTIONS`), since the command can't know whose
+directory it was given. The lesson is in where the rule lived: a retention policy kept in the options of whichever
+process opens the directory is only as safe as the least careful opener. A sturdier design records it in the store
+itself (the manifest), so every open applies the same rule.
+
+**Why not delete the lock file when an open is refused?**
+The review asked for it, since a refused open in a directory without a `LOCK` file (a snapshot, a copy) leaves one
+behind. But a lock file must never be deleted while anyone might use it: a process that opened it just before the
+deletion could lock the deleted file a moment later, while a third process creates a new `LOCK` and locks that, and
+both would think they own the store. An empty file is harmless, so the docs now say a refused open may create it,
+and a test checks it is the only addition (`LaterFormatTest.aRefusedOpenAddsAtMostTheEmptyLockFile`).
+
 **Why Java, for a storage engine?**
 The JDK has what this needs: `FileChannel.force` (which issues `F_FULLFSYNC` on macOS; checked in the JDK's own
 code), positional reads, CRC32C, `VarHandle` for the skip list's memory ordering, and virtual threads for a thread a

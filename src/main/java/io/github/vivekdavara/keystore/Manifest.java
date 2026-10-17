@@ -130,9 +130,12 @@ public record Manifest(long nextFileNumber, long logNumber, long lastSequence, l
         }
         if (magic != MAGIC && magic != MAGIC_V1) {
             // "KSMANIF" and a format this build doesn't know: refuse before reading further, since a
-            // later format may lay the rest out differently.
-            throw new IOException("manifest format " + (magic & 0xff) + ", which this build doesn't read (it reads "
-                    + OLDEST_FORMAT + " to " + FORMAT + "): written by a later version of keystore, or damaged");
+            // later format may lay the rest out differently. Below the oldest, no version wrote it.
+            int format = (int) (magic & 0xff);
+            throw new IOException("manifest format " + format + ", which this build doesn't read (it reads "
+                    + OLDEST_FORMAT + " to " + FORMAT + "): " + (format > FORMAT
+                            ? "written by a later version of keystore, or damaged"
+                            : "no version of keystore writes it, so the file is damaged"));
         }
         int stored = ByteBuffer.wrap(bytes, bytes.length - 4, 4).getInt();
         if (stored != crc(bytes, bytes.length - 4)) {

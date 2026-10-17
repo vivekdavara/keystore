@@ -54,19 +54,33 @@ class ManifestTest {
         assertEquals(Manifest.MAGIC, ByteBuffer.wrap(Files.readAllBytes(dir.resolve(Manifest.FILE))).getLong());
     }
 
-    /** "KSMANIF" and a 3, as a later build might write: refused by name, before any field is read. */
-    @Test
-    void aManifestInALaterFormatIsRefusedByName() {
+    /** {@code sample()} with the magic's last byte (its format) set to {@code format}, its checksum recomputed. */
+    private static byte[] inFormat(int format) {
         byte[] bytes = sample().encode();
-        bytes[7] = 3;
+        bytes[7] = (byte) format;
         CRC32C crc = new CRC32C();
         crc.update(bytes, 0, bytes.length - 4);
         ByteBuffer.wrap(bytes).putInt(bytes.length - 4, (int) crc.getValue());
+        return bytes;
+    }
+
+    /** "KSMANIF" and a 3, as a later build might write: refused by name, before any field is read. */
+    @Test
+    void aManifestInALaterFormatIsRefusedByName() {
+        byte[] bytes = inFormat(3);
         assertEquals("manifest format 3, which this build doesn't read (it reads 1 to 2): written by a later version of"
                 + " keystore, or damaged", assertThrows(IOException.class, () -> Manifest.decode(bytes)).getMessage());
         bytes[0] ^= 1;
         assertEquals("the manifest doesn't start with the manifest magic",
                 assertThrows(IOException.class, () -> Manifest.decode(bytes)).getMessage());
+    }
+
+    /** No version wrote format 0, so it can only be damage, not a later version's (from the release review). */
+    @Test
+    void aManifestBelowTheOldestFormatIsCalledDamaged() {
+        assertEquals("manifest format 0, which this build doesn't read (it reads 1 to 2): no version of keystore writes"
+                + " it, so the file is damaged", assertThrows(IOException.class, () -> Manifest.decode(inFormat(0)))
+                .getMessage());
     }
 
     @Test

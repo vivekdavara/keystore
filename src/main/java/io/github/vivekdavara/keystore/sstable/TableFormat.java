@@ -84,9 +84,12 @@ final class TableFormat {
         return footer;
     }
 
+    /** Below this build's format (0, or a negative version field), no version wrote it. */
     private static String unreadable(long format) {
-        return "table format " + format + ", which this build doesn't read (it reads " + VERSION
-                + "): written by a later version of keystore, or damaged";
+        return "table format " + format + ", which this build doesn't read (it reads " + VERSION + "): "
+                + (format > VERSION
+                        ? "written by a later version of keystore, or damaged"
+                        : "no version of keystore writes it, so the file is damaged");
     }
 
     /**

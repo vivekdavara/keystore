@@ -479,6 +479,24 @@ class TableTest {
         }
     }
 
+    /** No version wrote format 0, by the version field or the magic: damage, not a later version (the release review). */
+    @Test
+    void aTableBelowTheOldestFormatIsCalledDamaged() throws IOException {
+        TreeMap<byte[], Entry> entries = new TreeMap<>(Bytes.ORDER);
+        entries.put(Bytes.utf8("a"), Entry.value(1, Bytes.utf8("x")));
+        Path labelled = write("labelled.sst", entries, 64);
+        TableSurgery.setFormatVersion(labelled, 0);
+        Path magic = write("magic.sst", entries, 64);
+        byte[] bytes = Files.readAllBytes(magic);
+        bytes[bytes.length - 1] = 0;
+        Files.write(magic, bytes);
+        for (Path damaged : List.of(labelled, magic)) {
+            CorruptTableException refused = assertThrows(CorruptTableException.class, () -> Table.open(damaged, 1, PLAIN));
+            assertTrue(refused.getMessage().endsWith(": table format 0, which this build doesn't read (it reads 1): no"
+                    + " version of keystore writes it, so the file is damaged"), refused.getMessage());
+        }
+    }
+
     @Test
     void anIndexClaimingAHugeBlockCountIsRefusedBeforeAllocating() throws IOException {
         TreeMap<byte[], Entry> entries = new TreeMap<>(Bytes.ORDER);

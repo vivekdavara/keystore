@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.vivekdavara.keystore.Manifest.TableRef;
 import java.io.IOException;
@@ -73,6 +74,19 @@ class ManifestTest {
         bytes[0] ^= 1;
         assertEquals("the manifest doesn't start with the manifest magic",
                 assertThrows(IOException.class, () -> Manifest.decode(bytes)).getMessage());
+    }
+
+    /**
+     * The format comes first: a later format whose layout isn't this one's (here its checksum isn't
+     * where format 2 keeps it) is still named, not reported as a checksum failure. (The release
+     * review moved the check after the checksum's, and no test noticed.)
+     */
+    @Test
+    void aLaterFormatIsNamedBeforeTheChecksumIsChecked() {
+        byte[] bytes = sample().encode();
+        bytes[7] = 3; // the checksum not recomputed
+        String message = assertThrows(IOException.class, () -> Manifest.decode(bytes)).getMessage();
+        assertTrue(message.startsWith("manifest format 3, "), message);
     }
 
     /** No version wrote format 0, so it can only be damage, not a later version's (from the release review). */

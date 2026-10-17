@@ -33,6 +33,14 @@ class MediansTest {
                 + " [3.37..3.39]); reopen 10 [9..11] ms"), Medians.summarise(lines));
     }
 
+    /** A number glued to a word ("5ms") is part of the word, so runs that differ there are refused. */
+    @Test
+    void aNumberGluedToAWordIsPartOfIt() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> Medians.summarise(List.of("x: took 5ms", "x: took 7ms")));
+        assertTrue(e.getMessage().startsWith("x: the runs' words differ"), e.getMessage());
+    }
+
     @Test
     void anEvenNumberOfRunsTakesTheMeanOfTheMiddleTwo() {
         List<String> lines = List.of("scan: 60 ms", "scan: 75 ms", "scan: 61 ms", "scan: 100 ms");

@@ -479,6 +479,32 @@ class TableTest {
         }
     }
 
+    /**
+     * The magic is read before the footer is: a later format's footer (here its checksum doesn't
+     * match this format's) is named by the magic, and a file whose magic isn't "KSTABLE" at all is no
+     * table, not a later format. (The release review moved the first check after the footer's
+     * checksum, and removed the prefix check; no test noticed either.)
+     */
+    @Test
+    void theMagicIsReadFirstAndWithoutItTheFileIsNoTable() throws IOException {
+        TreeMap<byte[], Entry> entries = new TreeMap<>(Bytes.ORDER);
+        entries.put(Bytes.utf8("a"), Entry.value(1, Bytes.utf8("x")));
+        Path later = write("later.sst", entries, 64);
+        byte[] bytes = Files.readAllBytes(later);
+        bytes[bytes.length - 1] = 2; // "KSTABLE" and a 2
+        bytes[bytes.length - 12] ^= 1; // and a footer this format's checksum doesn't match
+        Files.write(later, bytes);
+        CorruptTableException refused = assertThrows(CorruptTableException.class, () -> Table.open(later, 1, PLAIN));
+        assertTrue(refused.getMessage().contains(": table format 2, "), refused.getMessage());
+
+        Path none = write("none.sst", entries, 64);
+        bytes = Files.readAllBytes(none);
+        Arrays.fill(bytes, bytes.length - 8, bytes.length - 1, (byte) 0); // the magic's "KSTABLE" gone, its 1 kept
+        Files.write(none, bytes);
+        refused = assertThrows(CorruptTableException.class, () -> Table.open(none, 1, PLAIN));
+        assertTrue(refused.getMessage().endsWith(": no table magic at the end of the file"), refused.getMessage());
+    }
+
     /** No version wrote format 0, by the version field or the magic: damage, not a later version (the release review). */
     @Test
     void aTableBelowTheOldestFormatIsCalledDamaged() throws IOException {

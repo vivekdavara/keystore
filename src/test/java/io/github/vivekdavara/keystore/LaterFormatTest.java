@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.vivekdavara.keystore.sstable.TableSurgery;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -115,6 +116,58 @@ class LaterFormatTest {
             assertUnchanged(before, files(refused));
             assertEquals(0, Files.size(refused.resolve(Store.LOCK_FILE)), "the lock file is empty");
         }
+    }
+
+    /**
+     * A store with what a successful open changes: a torn tail in its newest log, a table the
+     * manifest doesn't name, and a covered log the open's options don't keep. The control, a copy
+     * with every table in this build's format, opens and truncates, deletes and deletes; the store
+     * itself, its live table in a later format, is refused with every file as it was. So the tables'
+     * format is checked before recovery truncates or deletes anything. (The release review moved the
+     * tables' check after the newest log's recovery, and the deletions before the tables' check; no
+     * test noticed either.)
+     */
+    @Test
+    void aRefusedOpenTruncatesAndDeletesNothingASuccessfulOneWould() throws IOException {
+        Path store = dir.resolve("store");
+        try (Store s = Store.open(store, Options.defaults().withRetainLogBytes(1 << 20))) {
+            for (int i = 0; i < 60; i++) {
+                if (i == 50) {
+                    s.flush(); // a table, and the covered log kept
+                }
+                s.put(Bytes.utf8("k" + i), Bytes.utf8("v" + i));
+            }
+        }
+        List<Path> logs;
+        Path live;
+        try (Stream<Path> list = Files.list(store)) {
+            List<Path> all = list.sorted().toList();
+            logs = all.stream().filter(f -> f.toString().endsWith(".log")).toList();
+            live = all.stream().filter(f -> f.toString().endsWith(".sst")).findFirst().orElseThrow();
+        }
+        assertEquals(2, logs.size(), "a covered log and the newest: " + logs);
+        Path newest = logs.get(1);
+        try (RandomAccessFile raw = new RandomAccessFile(newest.toFile(), "rw")) {
+            raw.setLength(raw.length() - 3); // the last write torn
+        }
+        Files.copy(live, store.resolve("000099.sst")); // a table the manifest doesn't name
+
+        Path control = Files.createDirectory(dir.resolve("control"));
+        for (Map.Entry<String, byte[]> f : files(store).entrySet()) {
+            Files.write(control.resolve(f.getKey()), f.getValue());
+        }
+        try (Store s = Store.open(control)) {
+            assertEquals(59, s.lastSequence(), "the torn write dropped");
+        }
+        Map<String, byte[]> opened = files(control);
+        assertTrue(Files.size(control.resolve(newest.getFileName())) < Files.size(newest), "the control's tail truncated");
+        assertTrue(!opened.containsKey("000099.sst") && !opened.containsKey(logs.get(0).getFileName().toString()),
+                "the control's orphan table and covered log deleted: " + opened.keySet());
+
+        TableSurgery.setFormatVersion(live, 2);
+        Map<String, byte[]> before = files(store);
+        assertThrows(IOException.class, () -> Store.open(store));
+        assertUnchanged(before, files(store));
     }
 
     @Test

@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.1 (2026-10-17)
+
+Two fixes to the release check's scripts, found the same day after v1.0.0; the store, its files and its commands are
+unchanged, and the README's measurements are v1.0.0's.
+
+- `scripts/release_check.sh`: when there were no test reports to keep (a check that failed before the clean export
+  ran), the exit trap stopped at the failed copy, so the temporary export was never removed and the script exited 1.
+- `scripts/smoke.sh`: a JVM notice printed before "not found" (such as "Picked up JAVA_TOOL_OPTIONS") failed it.
+
 ## v1.0.0 (2026-10-17)
 
 The first release: an LSM-tree key-value store in Java 21 with a write-ahead log, SSTables, size-tiered compaction,

@@ -6,7 +6,7 @@
 
     <groupId>io.github.vivekdavara</groupId>
     <artifactId>keystore</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     <name>keystore</name>
     <description>LSM-tree key-value store with a write-ahead log, SSTables and replication</description>
 

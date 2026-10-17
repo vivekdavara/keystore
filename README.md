@@ -4,7 +4,8 @@ An LSM-tree key-value store in Java 21, built the way LevelDB and RocksDB are: a
 checksums, an in-memory skip list, SSTables with a sparse index and Bloom filters, and size-tiered compaction; a TCP
 server with a small text protocol; and leader-follower replication by shipping the write-ahead log.
 
-**Status: v1.0.0** (day 5 of 5, 2026-10-17; [CHANGELOG.md](CHANGELOG.md)). Built in five days: day 1 the write path's
+**Status: v1.0.1** (day 5 of 5, 2026-10-17: v1.0.0, then two fixes to the release check's scripts as v1.0.1;
+[CHANGELOG.md](CHANGELOG.md)). Built in five days: day 1 the write path's
 foundation (the memtable, a hand-written skip list with lock-free reads; the write-ahead log; crash recovery;
 `put`/`get`/`delete`); day 2 the LSM tree (flushes to immutable tables at 4 MiB of log, a manifest naming the live
 tables, reads through the memtable and then the tables newest first, size-tiered merges); day 3 the network (a server
@@ -25,7 +26,7 @@ rather than only getting the happy path fast. Every claim below has a test or a 
 
 ## Results at a glance
 
-v1.0.0, as the release check measured it at `3c06d44` (Apple M3, macOS 26.6.2, OpenJDK 21.0.12, on battery, with
+v1.0.0, as the release check measured it at `3c06d44` (v1.0.1 changes only two scripts; Apple M3, macOS 26.6.2, OpenJDK 21.0.12, on battery, with
 a video playing; 16-byte keys and 100-byte values, synthetic). Medians of 5 runs unless it says JMH; "Results" has
 every figure with its range, its conditions and each day's own.
 

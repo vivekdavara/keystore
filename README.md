@@ -4,18 +4,18 @@ An LSM-tree key-value store in Java 21, built the way LevelDB and RocksDB are: a
 checksums, an in-memory skip list, SSTables with a sparse index and Bloom filters, and size-tiered compaction; a TCP
 server with a small text protocol; and leader-follower replication by shipping the write-ahead log.
 
-**Status: day 4 of 5.** Day 1 built the write path's foundation: the memtable (a hand-written skip list with
-lock-free reads), the write-ahead log, crash recovery, and `put`/`get`/`delete`. Day 2 made it an LSM tree: the
-memtable is flushed to immutable tables when the log reaches 4 MiB, a manifest names the live tables, reads go
-through the memtable and then the tables newest first, and tables of similar size are merged. Day 3 put it on the
-network: a server (a virtual thread a connection, lengths before binary data), and followers that apply the
-leader's log records under the leader's sequence numbers, read by the leader from its own log files, and catch up
-from their own last sequence number after any break. Day 4 tested it with real process deaths (a writer, and a
-follower, killed with SIGKILL again and again, every acknowledged write checked), added snapshots (a copy of the
-store as of one sequence number, made of hard links to its tables, which a follower that fell too far behind starts
-again from), `keystore verify` (reads every block, to find damage before a read does), and JMH benchmarks. The store
-depends on nothing; the tests use JUnit, and the benchmarks JMH. [DESIGN.md](DESIGN.md) has the design and the plan
-for day 5.
+**Status: v1.0.0** (day 5 of 5, 2026-10-17; [CHANGELOG.md](CHANGELOG.md)). Built in five days: day 1 the write path's
+foundation (the memtable, a hand-written skip list with lock-free reads; the write-ahead log; crash recovery;
+`put`/`get`/`delete`); day 2 the LSM tree (flushes to immutable tables at 4 MiB of log, a manifest naming the live
+tables, reads through the memtable and then the tables newest first, size-tiered merges); day 3 the network (a server
+with a virtual thread a connection, and followers that apply the leader's log records under the leader's sequence
+numbers, read by the leader from its own log files, and catch up from their own position after any break); day 4
+failure and measurement (a writer, a follower and a leader killed with SIGKILL again and again, every acknowledged
+write checked; snapshots made of hard links to the tables; `keystore verify`; JMH); day 5 the release (`keystore
+version`, refusing files from later versions before changing anything, and a release check that runs every test and
+measurement again at the release's commit). The store depends on nothing; the tests use JUnit, and the benchmarks
+JMH. [DESIGN.md](DESIGN.md) has the design, and [WALKTHROUGH.md](WALKTHROUGH.md) the questions an interviewer is
+likely to ask, answered from the code.
 
 ## Why
 
@@ -252,6 +252,11 @@ CI runs it on Linux and macOS.
 | A snapshot is exactly a prefix, linked or copied; every write and force of one failed in turn leaves nothing; its forces come in order; a merge that replaces its tables mid-copy doesn't hurt it; a `BEHIND` follower starts again from one | `SnapshotTest` |
 | A damaged block fails its read and nothing else; a merge that reaches it stops writes and keeps the manifest; the server's reply says what's wrong; `verify` finds it before any read does | `TableDamageTest`, `MainTest` |
 | The manifest keeps the last write's checksum through flushes and merges; a follower restarted with every write in a table still gets `DIVERGED` from a leader with a different history | `ReplicateTest`, `ReplicationTest`, `ManifestTest` |
+| **Day 5** | |
+| A manifest or table in a later version's format is refused by name, and the refused open changes no file | `LaterFormatTest`, `ManifestTest`, `TableTest` |
+| `keystore version` names the pom's version, and its format numbers are the ones in the files a store writes | `MainTest` |
+| Every "Run it" example prints what the README shows (put to dump, verify, snapshot, version) | `ReadmeTest` |
+| The medians the release check reports | `MediansTest` |
 
 Most of the mechanisms these tests cover were also checked the other way round: removed in a copy of the file, a
 test had to fail, and the file was restored. DESIGN.md, "Testing", lists which.
@@ -459,7 +464,7 @@ What the numbers say:
   second. The range across the 5 runs was 257 to 517 ms.
 - **The scan that tells a torn tail from damage costs about a millisecond per megabyte** over zeros or random bytes:
   most offsets fail on the length or the op byte. A value built to look like records at every offset is decided by
-  the scan's budget (see "Review of day 1").
+  the scan's budget (see "Reviews", day 1).
 - **The hand-written skip list is close to the JDK's** for inserts (2% slower, median) and 10% slower for lookups.
   The run-to-run spread is wide (lookups 653,000 to 843,000 a second), so these are rough.
 - **Holding next pointers in a plain array, through a `VarHandle`**, instead of an `AtomicReferenceArray`
@@ -468,7 +473,12 @@ What the numbers say:
   744,000 before and 722,000 after, within the noise. My guess that the extra pointer hop slowed lookups was wrong,
   or at least not measurable this way.
 
-## Review of day 1
+## Reviews
+
+Each day's code was reviewed by one or two background agents, each in its own git worktree at a fixed commit and
+worded as a correctness review. Below is what each found, and what was done about it.
+
+### Day 1
 
 Two review agents went over the day's code at `b28ac73`, one on the log and recovery, one on the memtable and the
 store's concurrency, each in its own git worktree. They reported only what they had reproduced, and I reproduced
@@ -498,7 +508,7 @@ each finding again before fixing it. Every fix has a test that fails without it.
   100 times in 100; the counter that makes the test's checks exact also hides a missing edge. That property rests on
   the argument in DESIGN.md, and would need a jcstress-style harness to test.
 
-## Review of day 2
+### Day 2
 
 Two review agents started on the day's code at `6314e01`, one on the table format and recovery, one on the store's
 flushes, merges and concurrency, each in its own git worktree. Both were cut off by an account usage limit after
@@ -535,7 +545,7 @@ writes. Nothing acknowledged was lost and the manifest never named a missing tab
   running after a failure, and a failed flush taken for a failed per-write force (close then skips a force it needs
   under `NEVER`).
 
-## Review of day 3
+### Day 3
 
 One review agent (the account's usage limit stopped two on day 2) started on the day's code at `3195c23`, in its own
 git worktree, worded as a correctness review of the server, the tail, the follower and `Store.replicate`, for about
@@ -565,7 +575,7 @@ in DESIGN.md's "What the tests can't show": on this Mac nothing fails without it
 While it ran I added `FollowerCrashCycleTest` (a follower crashed at any write or force recovers to a prefix of its
 leader's history) and `FollowerStreamTest` (a scripted leader that sends gaps, repeats and damage).
 
-## Review of day 4
+### Day 4
 
 One review agent started at `0520e30` (the kill tests, the manifest's checksum and the first snapshot code), in its
 own git worktree, worded as a correctness review, for about 13 minutes. It found one bug, with a test that failed; I
@@ -666,6 +676,10 @@ wasn't used up when it caught up in fewer, and fired at the cycle's close; the c
 - **`verify` is a separate full read**, not something `open` does: opening checks what it must to serve reads
   safely (footers, filters, indexes), and a read checks its block; reading every block on every open would make
   opening a large store as slow as reading it.
+- **A file from a later version is refused before the open changes anything.** Opening a store truncates a torn
+  tail and deletes every file the manifest doesn't name, so a build that read a later manifest as its own could
+  delete the later version's files. Each table's and the manifest's format is checked first, and the refusal names
+  it (DESIGN.md, "The release").
 
 ## Limitations
 
@@ -694,6 +708,9 @@ wasn't used up when it caught up in fewer, and fired at the cycle's close; the c
   running follower's too) a merge can make a table it reads go missing, or a flush between its reading the manifest
   and listing the logs can make a good log look out of sequence: run it on a stopped store or a snapshot.
 - No authentication or TLS; the server listens on the loopback address.
+- A log record has no format version and the protocol no handshake: a change to either needs a new file name or a
+  new command (DESIGN.md, "The release"). `keystore verify` reports a file in a later format as damaged (exit 3),
+  with the message saying which format it is.
 
 DESIGN.md's "Limitations" has the full list.
 

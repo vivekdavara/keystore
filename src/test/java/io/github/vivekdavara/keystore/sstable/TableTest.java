@@ -463,6 +463,23 @@ class TableTest {
      * The count is now checked against the index's length first.
      */
     @Test
+    void aTableInALaterFormatIsRefusedByName() throws IOException {
+        TreeMap<byte[], Entry> entries = new TreeMap<>(Bytes.ORDER);
+        entries.put(Bytes.utf8("a"), Entry.value(1, Bytes.utf8("x")));
+        Path labelled = write("labelled.sst", entries, 64);
+        TableSurgery.setFormatVersion(labelled, 2); // the footer's version field, its checksum recomputed
+        Path magic = write("magic.sst", entries, 64);
+        byte[] bytes = Files.readAllBytes(magic);
+        bytes[bytes.length - 1] = 2; // "KSTABLE" and a 2
+        Files.write(magic, bytes);
+        for (Path later : List.of(labelled, magic)) {
+            CorruptTableException refused = assertThrows(CorruptTableException.class, () -> Table.open(later, 1, PLAIN));
+            assertTrue(refused.getMessage().endsWith(": table format 2, which this build doesn't read (it reads 1): written"
+                    + " by a later version of keystore, or damaged"), refused.getMessage());
+        }
+    }
+
+    @Test
     void anIndexClaimingAHugeBlockCountIsRefusedBeforeAllocating() throws IOException {
         TreeMap<byte[], Entry> entries = new TreeMap<>(Bytes.ORDER);
         entries.put(Bytes.utf8("a"), Entry.value(1, Bytes.utf8("x")));

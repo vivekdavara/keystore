@@ -54,6 +54,21 @@ class ManifestTest {
         assertEquals(Manifest.MAGIC, ByteBuffer.wrap(Files.readAllBytes(dir.resolve(Manifest.FILE))).getLong());
     }
 
+    /** "KSMANIF" and a 3, as a later build might write: refused by name, before any field is read. */
+    @Test
+    void aManifestInALaterFormatIsRefusedByName() {
+        byte[] bytes = sample().encode();
+        bytes[7] = 3;
+        CRC32C crc = new CRC32C();
+        crc.update(bytes, 0, bytes.length - 4);
+        ByteBuffer.wrap(bytes).putInt(bytes.length - 4, (int) crc.getValue());
+        assertEquals("manifest format 3, which this build doesn't read (it reads 1 to 2): written by a later version of"
+                + " keystore, or damaged", assertThrows(IOException.class, () -> Manifest.decode(bytes)).getMessage());
+        bytes[0] ^= 1;
+        assertEquals("the manifest doesn't start with the manifest magic",
+                assertThrows(IOException.class, () -> Manifest.decode(bytes)).getMessage());
+    }
+
     @Test
     void theLastChecksumIsUnsigned32BitsOrUnknown() throws IOException {
         for (long checksum : new long[] {-1, 0, 1, 0x7fffffffL, 0x80000000L, 0xffffffffL}) {

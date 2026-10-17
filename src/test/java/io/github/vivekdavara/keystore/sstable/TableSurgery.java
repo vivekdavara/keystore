@@ -36,6 +36,19 @@ public final class TableSurgery {
         Files.write(file, bytes);
     }
 
+    /**
+     * Writes {@code version} into the footer's format version and recomputes the footer's checksum:
+     * the table as a later build would label it.
+     */
+    public static void setFormatVersion(Path file, int version) throws IOException {
+        byte[] bytes = Files.readAllBytes(file);
+        int at = bytes.length - TableFormat.FOOTER_BYTES;
+        ByteBuffer footer = ByteBuffer.wrap(bytes, at, TableFormat.FOOTER_BYTES).slice();
+        footer.putInt(TableFormat.FOOTER_BYTES - 16, version);
+        footer.putInt(TableFormat.FOOTER_BYTES - 12, TableFormat.crc(bytes, at, TableFormat.FOOTER_BYTES - 12));
+        Files.write(file, bytes);
+    }
+
     private static TableFormat.Footer footer(byte[] bytes) throws IOException {
         String[] problem = new String[1];
         TableFormat.Footer f = TableFormat.decodeFooter(

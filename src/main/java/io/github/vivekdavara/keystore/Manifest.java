@@ -125,8 +125,14 @@ public record Manifest(long nextFileNumber, long logNumber, long lastSequence, l
         }
         ByteBuffer in = ByteBuffer.wrap(bytes);
         long magic = in.getLong();
-        if (magic != MAGIC && magic != MAGIC_V1) {
+        if (magic >>> 8 != MAGIC >>> 8) {
             throw new IOException("the manifest doesn't start with the manifest magic");
+        }
+        if (magic != MAGIC && magic != MAGIC_V1) {
+            // "KSMANIF" and a format this build doesn't know: refuse before reading further, since a
+            // later format may lay the rest out differently.
+            throw new IOException("manifest format " + (magic & 0xff) + ", which this build doesn't read (it reads "
+                    + OLDEST_FORMAT + " to " + FORMAT + "): written by a later version of keystore, or damaged");
         }
         int stored = ByteBuffer.wrap(bytes, bytes.length - 4, 4).getInt();
         if (stored != crc(bytes, bytes.length - 4)) {

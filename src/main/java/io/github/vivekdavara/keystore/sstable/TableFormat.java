@@ -32,7 +32,7 @@ final class TableFormat {
     static final int TRAILER_BYTES = 4;
     static final int FOOTER_BYTES = 8 + 4 + 8 + 4 + 8 + 8 + 8 + 8 + 4 + 4 + 8;
     static final int VERSION = 1;
-    /** "KSTABLE" and a 1. */
+    /** "KSTABLE" and a 1: the magic's last byte is the format version too. */
     static final long MAGIC = 0x4b535441424c4501L;
 
     static final byte VALUE = 1;
@@ -58,8 +58,14 @@ final class TableFormat {
     /** The footer in {@code bytes}, or null with {@code problem[0]} set. */
     static Footer decodeFooter(byte[] bytes, String[] problem) {
         ByteBuffer in = ByteBuffer.wrap(bytes);
-        if (in.getLong(FOOTER_BYTES - 8) != MAGIC) {
+        long magic = in.getLong(FOOTER_BYTES - 8);
+        if (magic >>> 8 != MAGIC >>> 8) {
             problem[0] = "no table magic at the end of the file";
+            return null;
+        }
+        if (magic != MAGIC) {
+            // A later format may lay the footer out differently: refuse before reading it.
+            problem[0] = unreadable(magic & 0xff);
             return null;
         }
         int checked = FOOTER_BYTES - 12;
@@ -72,10 +78,15 @@ final class TableFormat {
                 in.getLong(), in.getLong(), in.getLong(), in.getLong());
         int version = in.getInt();
         if (version != VERSION) {
-            problem[0] = "format version " + version + ", not " + VERSION;
+            problem[0] = unreadable(version);
             return null;
         }
         return footer;
+    }
+
+    private static String unreadable(long format) {
+        return "table format " + format + ", which this build doesn't read (it reads " + VERSION
+                + "): written by a later version of keystore, or damaged";
     }
 
     /**
